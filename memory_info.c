@@ -21,7 +21,7 @@ static char *message = NULL;
 // Proc dir entry
 static struct proc_dir_entry *our_proc_file;
 
-#define HASH_SIZE 16
+#define HASH_TABLE_SIZE 16
 
 struct process_info
 {
@@ -40,7 +40,7 @@ struct process_info
 // Hash Table //
 ////////////////
 
-DEFINE_HASHTABLE(process_hash_table, HASH_SIZE);
+DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
 
 void add_to_hash_table(struct process_info *new_item)
 {
@@ -314,7 +314,7 @@ static struct file_operations proc_file_operations = {
 // Initialize module
 static int __init memory_info_init(void)
 {
-    hash_init(process_hash_table, HASH_SIZE);
+    hash_init(process_hash_table, HASH_TABLE_SIZE);
 
     // Create proc entry
     our_proc_file = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_operations);
