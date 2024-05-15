@@ -60,7 +60,7 @@ void add_to_hash_table(struct process_info *new_item)
             return;
         }
     }
-    hash_add(process_hash_table, &new_item->hnode, hash);
+    hash_add(process_hash_table, HASH_TABLE_SIZE, &new_item->hnode, hash);
 }
 
 struct process_info *find_in_hash_table(char *name)
@@ -79,7 +79,9 @@ struct process_info *find_in_hash_table(char *name)
 void remove_from_hash_table(struct process_info *item)
 {
     hash_del(&item->hnode);
-    free_process_info(item);
+    kfree(info->pids);
+    kfree(info->name);
+    kfree(info);
 }
 ////////////////////////////////////////////////////////////////
 
@@ -183,7 +185,7 @@ void handle_all(void)
     struct hlist_node *tmp;
     unsigned int bkt;
 
-    hash_for_each(process_hash_table, bkt, tmp, info, hnode)
+    hash_for_each(process_hash_table, HASH_TABLE_SIZE, bkt, tmp, info, hnode);
     {
         append_process_info_to_output(info);
     }
@@ -208,22 +210,8 @@ void handle_del(const char *name)
         while (info)
         {
             del = info;
-            info = info->next
-                       remove_from_hash_table(del);
-            if (strcmp(info->name, name) == 0)
-            {
-                if (prev)
-                {
-                    prev->next = info->next;
-                }
-                else
-                {
-                    process_hash_table[hash_index] = info->next;
-                }
-                free_process_info(info);
-            }
-            prev = info;
             info = info->next;
+            remove_from_hash_table(del);
         }
         snprintf(output_buffer, sizeof(output_buffer), "[SUCCESS]\n");
         output_size = strlen(output_buffer);
@@ -301,6 +289,18 @@ static ssize_t procfile_write(struct file *file, const char __user *buffer, size
 // Structure that associates a set of function pointers (e.g., device_open)
 // that implement the corresponding file operations (e.g., open).
 /*-----------------------------------------------------------------------*/
+// this function reads a message from the pseudo file system via the seq_printf function
+static int show_the_proc(struct seq_file *a, void *v)
+{
+    seq_printf(a, "%s\n", message);
+    return 0;
+}
+
+// this function opens the proc entry by calling the show_the_proc function
+static int open_the_proc(struct inode *inode, struct file *file)
+{
+    return single_open(file, show_the_proc, NULL);
+}
 static struct file_operations proc_file_operations = {
     // defined in linux/fs.h
     .owner = THIS_MODULE,
@@ -340,7 +340,7 @@ static void __exit memory_info_exit(void)
     struct hlist_node *tmp;
     unsigned int bkt;
 
-    hash_for_each(process_hash_table, bkt, tmp, info, hnode)
+    hash_for_each(process_hash_table, HASH_TABLE_SIZE, bkt, tmp, info, hnode);
     {
         while (info)
         {
