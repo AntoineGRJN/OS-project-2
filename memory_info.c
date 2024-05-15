@@ -9,6 +9,7 @@
 #include <linux/sched/signal.h> // For task_struct and process iteration
 #include <linux/mm.h>
 #include <linux/hashtable.h>
+#include <linux/string.h>
 
 #define PROCFS_NAME "memory_info" // name of the proc entry
 
@@ -45,13 +46,14 @@ DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
 void add_to_hash_table(struct process_info *new_item)
 {
     unsigned long hash = full_name_hash(NULL, new_item->name, strlen(new_item->name));
-
+    printk("%s(%d) : %lu", new_item->name, strlen(new_item->name), hash);
     struct process_info *existing_item;
     // Check if the key already exists and handle according to policy
     hash_for_each_possible(process_hash_table, existing_item, hnode, hash)
     {
         if (strcmp(existing_item->name, new_item->name) == 0)
         {
+
             while (existing_item->next != NULL)
             {
                 existing_item = existing_item->next;
@@ -65,29 +67,35 @@ void add_to_hash_table(struct process_info *new_item)
 
 struct process_info *find_in_hash_table(char *name)
 {
+    if (!name)
+        return NULL; // Check for NULL pointer
+
     struct process_info *item;
-    unsigned long hash = full_name_hash(NULL, name, strlen(name));
+    size_t name_len = strlen(name);
+    unsigned long hash = full_name_hash(NULL, name, name_len);
 
     hash_for_each_possible(process_hash_table, item, hnode, hash)
     {
         if (strcmp(item->name, name) == 0)
-            return item; // Compare string contents
+        {
+            return item; // Successful match
+        }
     }
-    return NULL;
+    return NULL; // No match found
 }
 
 void remove_from_hash_table(struct process_info *item)
 {
     hash_del(&item->hnode);
-    kfree(item->pids);
-    kfree(item->name);
-    kfree(item);
 }
 ////////////////////////////////////////////////////////////////
 
-static char command_buffer[1024]; // Buffer to store command input
-static char output_buffer[4096];  // Buffer to store command output
-static int output_size = 0;       // Size of the current output
+static char *output_buffer = NULL;
+static size_t output_buffer_size = 0;
+static size_t output_buffer_pos = 0; // Current position for reading
+
+// static char output_buffer[4096]; // Buffer to store command output
+static int output_size = 0; // Size of the current output
 
 // Function to add process information to the hash table
 void add_process_info(struct task_struct *task)
@@ -128,7 +136,6 @@ void free_process_info(struct process_info *info)
 {
     kfree(info->pids);
     kfree(info->name);
-    kfree(info);
 }
 
 // Function to gather and populate process information
@@ -146,25 +153,38 @@ void gather_and_populate_data(void)
     rcu_read_unlock();
 }
 
-void append_process_info_to_output(struct process_info *info)
+// Function to append data to the buffer
+static void append_to_output_buffer(const char *data, size_t data_size)
 {
-    char temp_buffer[512];
-    int i;
-    snprintf(temp_buffer, sizeof(temp_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d): ",
-             info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-             info->readonly_pages, info->readonly_groups, info->total_pids);
-
-    strcat(output_buffer, temp_buffer);
-
-    for (i = 0; i < info->total_pids; i++)
+    if (output_buffer_pos + data_size >= output_buffer_size)
     {
-        char pid_buffer[32];
-        snprintf(pid_buffer, sizeof(pid_buffer), "%u; ", info->pids[i]);
-        strcat(output_buffer, pid_buffer);
+        size_t new_size = (output_buffer_size == 0) ? 1024 : output_buffer_size * 2;
+        while (output_buffer_pos + data_size >= new_size)
+        {
+            new_size *= 2;
+        }
+        char *new_buffer = krealloc(output_buffer, new_size, GFP_KERNEL);
+        if (!new_buffer)
+        {
+            printk(KERN_ERR "Failed to expand output buffer\n");
+            return;
+        }
+        output_buffer = new_buffer;
+        output_buffer_size = new_size;
     }
 
-    strcat(output_buffer, "\n");
-    output_size = strlen(output_buffer);
+    memcpy(output_buffer + output_buffer_pos, data, data_size);
+    output_buffer_pos += data_size;
+}
+
+void append_process_info_to_output(struct process_info *info)
+{
+    char info_buffer[512];
+    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d): \n",
+                       info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+                       info->readonly_pages, info->readonly_groups, info->total_pids);
+
+    append_to_output_buffer(info_buffer, len);
 }
 
 //////////////
@@ -200,8 +220,6 @@ void handle_filter(const char *name)
         append_process_info_to_output(info);
         return;
     }
-    printk(name);
-    printk("NULL");
 }
 
 // Deletes all process info for a given name
@@ -210,31 +228,31 @@ void handle_del(const char *name)
     struct process_info *info = find_in_hash_table(name), *del = NULL;
     if (info != NULL)
     {
-        while (info)
+        while (info != NULL)
         {
             del = info;
             info = info->next;
             remove_from_hash_table(del);
+            free_process_info(del);
+            kfree(del);
         }
-        snprintf(output_buffer, sizeof(output_buffer), "[SUCCESS]\n");
-        output_size = strlen(output_buffer);
+        append_to_output_buffer("[SUCCESS]\n", strlen("[SUCCESS]\n"));
     }
     else
     {
-        snprintf(output_buffer, sizeof(output_buffer), "[ERROR]: No such process\n");
-        output_size = strlen(output_buffer);
+        append_to_output_buffer("[ERROR]: No such process\n", strlen("[ERROR]: No such process\n"));
     }
 }
 
 void process_command(const char *command)
 {
-    output_size = 0; // Reset output size
+    output_buffer_size = 0;
+    output_buffer_pos = 0; // Reset output size
 
     if (strncmp(command, "RESET", 5) == 0)
     {
         handle_reset();
-        snprintf(output_buffer, sizeof(output_buffer), "[SUCCESS]\n");
-        output_size = strlen(output_buffer);
+        append_to_output_buffer("[SUCCESS]\n", strlen("[SUCCESS]\n"));
     }
     else if (strncmp(command, "ALL", 3) == 0)
     {
@@ -250,37 +268,46 @@ void process_command(const char *command)
     }
     else
     {
-        snprintf(output_buffer, sizeof(output_buffer), "[ERROR]: Unknown command\n");
-        output_size = strlen(output_buffer);
+        append_to_output_buffer("[ERROR]: Unknown command\n", strlen("[ERROR]: Unknown command\n"));
     }
 }
 
 //////////////////////////////////////////////////////////////
 
 // Read operation for the /proc file
-static ssize_t procfile_read(struct file *file, char __user *buffer, size_t size, loff_t *offset)
+static ssize_t procfile_read(struct file *file, char __user *buffer, size_t count, loff_t *offset)
 {
-    int len = min(size, (size_t)output_size);
-    if (*offset >= len)
-        return 0; // EOF
+    if (*offset >= output_buffer_pos)
+        return 0; // End of file
 
-    if (copy_to_user(buffer, output_buffer, len))
+    size_t available = output_buffer_pos - *offset;
+    size_t to_copy = min(available, count);
+    if (copy_to_user(buffer, output_buffer + *offset, to_copy))
         return -EFAULT;
 
-    *offset += len; // Update offset for the next read
-    return len;
+    *offset += to_copy;
+    return to_copy;
 }
 
 // Write operation for the /proc file
 static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
-    if (count > sizeof(command_buffer) - 1)
-        return -EFAULT;
+    char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
+    if (!command_buffer)
+    {
+        return -ENOMEM;
+    }
 
+    // copy data from user space to kernel space by using copy_from_user
     if (copy_from_user(command_buffer, buffer, count))
+    {
+        kfree(command_buffer);
         return -EFAULT;
-
-    command_buffer[count] = '\0'; // Null terminate the string
+    }
+    if (command_buffer[count - 1] == '\n')
+    {
+        command_buffer[count - 1] = '\0';
+    }
 
     // Process the command
     process_command(command_buffer);
@@ -345,12 +372,18 @@ static void __exit memory_info_exit(void)
 
     hash_for_each(process_hash_table, bkt, info, hnode)
     {
-        while (info)
+        remove_from_hash_table(info);
+        /*while (info != NULL)
         {
             del = info;
             info = info->next;
+            printk(del->name);
             remove_from_hash_table(del);
-        }
+            printk(del->name);
+            free_process_info(del);
+            kfree(del);
+            printk('nice');
+        }*/
     }
 
     // Remove proc entry
