@@ -8,6 +8,7 @@
 #include <linux/kernel.h>       // kernel logging
 #include <linux/sched/signal.h> // For task_struct and process iteration
 #include <linux/mm.h>
+#include <linux/hashtable.h>
 
 #define PROCFS_NAME "memory_info" // name of the proc entry
 
@@ -20,6 +21,8 @@ static char *message = NULL;
 // Proc dir entry
 static struct proc_dir_entry *our_proc_file;
 
+#define HASH_SIZE 16
+
 struct process_info
 {
     char *name;                    // Process name
@@ -31,34 +34,54 @@ struct process_info
     unsigned long readonly_pages;  // Number of read-only pages
     unsigned long readonly_groups; // Number of groups of identical read-only pages
     struct process_info *next;     // Next node in the hash chain
+    struct hlist_node hnode;
 };
+////////////////
+// Hash Table //
+////////////////
 
-#define HASH_SIZE 256
-static struct process_info *process_hash_table[HASH_SIZE];
+DEFINE_HASHTABLE(process_hash_table, HASH_SIZE);
 
-unsigned int hash(const char *str)
+void add_to_hash_table(struct process_info *new_item)
 {
-    unsigned long hash = 5381;
-    int c;
+    unsigned long hash = full_name_hash(NULL, new_item->name, strlen(new_item->name));
 
-    while ((c = *str++))
-        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
-
-    return hash % HASH_SIZE;
+    struct process_info *existing_item;
+    // Check if the key already exists and handle according to policy
+    hash_for_each_possible(process_hash_table, existing_item, hnode, hash)
+    {
+        if (strcmp(existing_item->name, new_item->name) == 0)
+        {
+            while (existing_item->next != NULL)
+            {
+                existing_item = existing_item->next;
+            }
+            existing_item->next = new_item;
+            return;
+        }
+    }
+    hash_add(process_hash_table, &new_item->hnode, hash);
 }
 
-// this function reads a message from the pseudo file system via the seq_printf function
-static int show_the_proc(struct seq_file *a, void *v)
+struct process_info *find_in_hash_table(char *name)
 {
-    seq_printf(a, "%s\n", message);
-    return 0;
+    struct process_info *item;
+    unsigned long hash = full_name_hash(NULL, name, strlen(name));
+
+    hash_for_each_possible(process_hash_table, item, hnode, hash)
+    {
+        if (strcmp(item->name, name) == 0)
+            return item; // Compare string contents
+    }
+    return NULL;
 }
 
-// this function opens the proc entry by calling the show_the_proc function
-static int open_the_proc(struct inode *inode, struct file *file)
+void remove_from_hash_table(struct process_info *item)
 {
-    return single_open(file, show_the_proc, NULL);
+    hash_del(&item->hnode);
+    free_process_info(item);
 }
+////////////////////////////////////////////////////////////////
 
 static char command_buffer[1024]; // Buffer to store command input
 static char output_buffer[4096];  // Buffer to store command output
@@ -67,7 +90,6 @@ static int output_size = 0;       // Size of the current output
 // Function to add process information to the hash table
 void add_process_info(struct task_struct *task)
 {
-    unsigned int hash_index = hash(task->comm);
     struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
     unsigned long valid_pages = 0;
 
@@ -97,11 +119,14 @@ void add_process_info(struct task_struct *task)
     info->next = NULL;
 
     // Insert into the hash table
-    if (process_hash_table[hash_index] != NULL)
-    {
-        info->next = process_hash_table[hash_index]; // Handle collision
-    }
-    process_hash_table[hash_index] = info;
+    add_to_hash_table(info);
+}
+
+void free_process_info(struct process_info *info)
+{
+    kfree(info->pids);
+    kfree(info->name);
+    kfree(info);
 }
 
 // Function to gather and populate process information
@@ -117,13 +142,6 @@ void gather_and_populate_data(void)
         }
     }
     rcu_read_unlock();
-}
-
-// Resets the data structure and re-populates it
-void handle_reset(void)
-{
-    // clear_data_structure();
-    gather_and_populate_data();
 }
 
 void append_process_info_to_output(struct process_info *info)
@@ -147,76 +165,74 @@ void append_process_info_to_output(struct process_info *info)
     output_size = strlen(output_buffer);
 }
 
-void free_process_info(struct process_info *info)
+//////////////
+// Commands //
+//////////////
+
+// Resets the data structure and re-populates it
+void handle_reset(void)
 {
-    kfree(info->pids);
-    kfree(info->name);
-    kfree(info);
+    // clear_data_structure();
+    gather_and_populate_data();
 }
 
 // Lists all processes and their memory info
 void handle_all(void)
 {
     struct process_info *info;
-    int i;
+    struct hlist_node *tmp;
+    unsigned int bkt;
 
-    for (i = 0; i < HASH_SIZE; i++)
+    hash_for_each(process_hash_table, bkt, tmp, info, hnode)
     {
-        info = process_hash_table[i];
-        while (info)
-        {
-            append_process_info_to_output(info);
-            info = info->next;
-        }
+        append_process_info_to_output(info);
     }
 }
 
 // Filters process info by name
 void handle_filter(const char *name)
 {
-    unsigned int hash_index = hash(name);
-    struct process_info *info = process_hash_table[hash_index];
-
-    while (info)
+    struct process_info *info = find_in_hash_table(name);
+    if (info != NULL)
     {
-        if (strcmp(info->name, name) == 0)
-        {
-            append_process_info_to_output(info);
-            break;
-        }
-        info = info->next;
+        append_process_info_to_output(info);
     }
 }
 
 // Deletes all process info for a given name
 void handle_del(const char *name)
 {
-    unsigned int hash_index = hash(name);
-    struct process_info *info = process_hash_table[hash_index], *prev = NULL;
-
-    while (info)
+    struct process_info *info = find_in_hash_table(name), *del = NULL;
+    if (info != NULL)
     {
-        if (strcmp(info->name, name) == 0)
+        while (info)
         {
-            if (prev)
+            del = info;
+            info = info->next
+                       remove_from_hash_table(del);
+            if (strcmp(info->name, name) == 0)
             {
-                prev->next = info->next;
+                if (prev)
+                {
+                    prev->next = info->next;
+                }
+                else
+                {
+                    process_hash_table[hash_index] = info->next;
+                }
+                free_process_info(info);
             }
-            else
-            {
-                process_hash_table[hash_index] = info->next;
-            }
-            free_process_info(info);
-            snprintf(output_buffer, sizeof(output_buffer), "[SUCCESS]\n");
-            output_size = strlen(output_buffer);
-            return;
+            prev = info;
+            info = info->next;
         }
-        prev = info;
-        info = info->next;
+        snprintf(output_buffer, sizeof(output_buffer), "[SUCCESS]\n");
+        output_size = strlen(output_buffer);
     }
-
-    snprintf(output_buffer, sizeof(output_buffer), "[ERROR]: No such process\n");
-    output_size = strlen(output_buffer);
+    else
+    {
+        snprintf(output_buffer, sizeof(output_buffer), "[ERROR]: No such process\n");
+        output_size = strlen(output_buffer);
+    }
 }
 
 void process_command(const char *command)
@@ -247,6 +263,8 @@ void process_command(const char *command)
         output_size = strlen(output_buffer);
     }
 }
+
+//////////////////////////////////////////////////////////////
 
 // Read operation for the /proc file
 static ssize_t procfile_read(struct file *file, char __user *buffer, size_t size, loff_t *offset)
@@ -296,11 +314,7 @@ static struct file_operations proc_file_operations = {
 // Initialize module
 static int __init memory_info_init(void)
 {
-    int i;
-    for (i = 0; i < HASH_SIZE; i++)
-    {
-        process_hash_table[i] = NULL;
-    }
+    hash_init(process_hash_table, HASH_SIZE);
 
     // Create proc entry
     our_proc_file = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_operations);
@@ -322,20 +336,17 @@ static int __init memory_info_init(void)
 // Cleanup module
 static void __exit memory_info_exit(void)
 {
-    int i;
-    struct process_info *info, *temp;
+    struct process_info *info, *del;
+    struct hlist_node *tmp;
+    unsigned int bkt;
 
-    // Free the hash table entries
-    for (i = 0; i < HASH_SIZE; i++)
+    hash_for_each(process_hash_table, bkt, tmp, info, hnode)
     {
-        info = process_hash_table[i];
         while (info)
         {
-            temp = info;
+            del = info;
             info = info->next;
-            kfree(temp->pids);
-            kfree(temp->name);
-            kfree(temp);
+            remove_from_hash_table(del);
         }
     }
 
