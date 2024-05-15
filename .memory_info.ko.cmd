@@ -1,0 +1,1 @@
+cmd_/home/student/OS-project-2/memory_info.ko := ld -r -m elf_i386 -T ./scripts/module-common.lds --build-id  -o /home/student/OS-project-2/memory_info.ko /home/student/OS-project-2/memory_info.o /home/student/OS-project-2/memory_info.mod.o ;  true

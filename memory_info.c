@@ -68,6 +68,7 @@ static int output_size = 0;       // Size of the current output
 void add_process_info(struct task_struct *task)
 {
     unsigned int hash_index = hash(task->comm);
+    printk("%d", hash_index);
     struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
     unsigned long valid_pages = 0;
 
@@ -173,10 +174,11 @@ void handle_all(void)
 
 // Filters process info by name
 void handle_filter(const char *name)
-{
+{   
     unsigned int hash_index = hash(name);
+    printk(name);
+    printk("%d", hash_index);
     struct process_info *info = process_hash_table[hash_index];
-
     while (info)
     {
         if (strcmp(info->name, name) == 0)
