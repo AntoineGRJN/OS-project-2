@@ -60,7 +60,7 @@ void add_to_hash_table(struct process_info *new_item)
             return;
         }
     }
-    hash_add(process_hash_table, HASH_TABLE_SIZE, &new_item->hnode, hash);
+    hash_add(process_hash_table, &new_item->hnode, hash);
 }
 
 struct process_info *find_in_hash_table(char *name)
@@ -185,7 +185,7 @@ void handle_all(void)
     struct hlist_node *tmp;
     unsigned int bkt;
 
-    hash_for_each(process_hash_table, HASH_TABLE_SIZE, bkt, tmp, info, hnode);
+    hash_for_each(process_hash_table, bkt, info, hnode)
     {
         append_process_info_to_output(info);
     }
@@ -314,7 +314,7 @@ static struct file_operations proc_file_operations = {
 // Initialize module
 static int __init memory_info_init(void)
 {
-    hash_init(process_hash_table, HASH_TABLE_SIZE);
+    hash_init(process_hash_table);
 
     // Create proc entry
     our_proc_file = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_operations);
@@ -340,7 +340,7 @@ static void __exit memory_info_exit(void)
     struct hlist_node *tmp;
     unsigned int bkt;
 
-    hash_for_each(process_hash_table, HASH_TABLE_SIZE, bkt, tmp, info, hnode);
+    hash_for_each(process_hash_table, bkt, info, hnode)
     {
         while (info)
         {
