@@ -198,7 +198,10 @@ void handle_filter(const char *name)
     if (info != NULL)
     {
         append_process_info_to_output(info);
+        return;
     }
+    printk(name);
+    printk("NULL");
 }
 
 // Deletes all process info for a given name
