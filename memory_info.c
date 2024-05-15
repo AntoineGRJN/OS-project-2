@@ -346,4 +346,3 @@ static void __exit memory_info_exit(void)
 
 module_init(memory_info_init);
 module_exit(memory_info_exit);
-
