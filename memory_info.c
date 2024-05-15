@@ -28,7 +28,7 @@ struct process_info
 {
     char *name;                    // Process name
     int total_pids;                // Total number of PIDs in this group
-    pid_t *pids;                   // Dynamic array of PID numbers
+    pid_t pid;                     // PID number
     unsigned long total_pages;     // Total number of pages
     unsigned long valid_pages;     // Number of valid pages
     unsigned long invalid_pages;   // Number of invalid pages
@@ -37,6 +37,17 @@ struct process_info
     struct process_info *next;     // Next node in the hash chain
     struct hlist_node hnode;
 };
+
+struct process_info *gather_items(struct process_info *item1, struct process_info *item2)
+{
+    item1->total_pids += item2->total_pids;
+    item1->total_pages += item2->total_pages;
+    item1->valid_pages += item2->valid_pages;
+    item1->invalid_pages += item2->invalid_pages;
+    item1->readonly_pages += item2->readonly_pages;
+    item1->readonly_groups += item2->readonly_groups;
+    return item1;
+}
 ////////////////
 // Hash Table //
 ////////////////
@@ -46,18 +57,18 @@ DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
 void add_to_hash_table(struct process_info *new_item)
 {
     unsigned long hash = full_name_hash(NULL, new_item->name, strlen(new_item->name));
-    printk("%s(%d) : %lu", new_item->name, strlen(new_item->name), hash);
     struct process_info *existing_item;
     // Check if the key already exists and handle according to policy
     hash_for_each_possible(process_hash_table, existing_item, hnode, hash)
     {
         if (strcmp(existing_item->name, new_item->name) == 0)
         {
-
             while (existing_item->next != NULL)
             {
+                existing_item = gather_items(existing_item, new_item);
                 existing_item = existing_item->next;
             }
+            existing_item = existing_item = gather_items(existing_item, new_item);
             existing_item->next = new_item;
             return;
         }
@@ -104,28 +115,24 @@ void add_process_info(struct task_struct *task)
     unsigned long valid_pages = 0;
 
     if (!info)
-        return; // Handle kmalloc failure
+        return -ENOMEM; // Handle kmalloc failure
 
     // Initialize the struct
     info->name = kstrdup(task->comm, GFP_KERNEL);
-    info->pids = kmalloc(sizeof(pid_t), GFP_KERNEL);
-    info->pids[0] = task->pid;
+    info->pid = task->pid;
     info->total_pids = 1;
     info->total_pages = get_mm_rss(task->mm);
     if (task->mm)
     {
-        if (task->mm)
-        {
-            valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
-                          atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
-                          atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
-        }
-        info->valid_pages = valid_pages;
+        valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
+                      atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
+                      atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
     }
+
     info->valid_pages = valid_pages;                             // Example for valid pages
     info->invalid_pages = info->total_pages - info->valid_pages; // Simplified calculation
-    info->readonly_pages = 0;                                    // count_readonly_pages(task);
-    info->readonly_groups = 0;                                   // count_readonly_groups(task); // Placeholder for actual implementation
+    info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
+    info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
     info->next = NULL;
 
     // Insert into the hash table
@@ -134,7 +141,6 @@ void add_process_info(struct task_struct *task)
 
 void free_process_info(struct process_info *info)
 {
-    kfree(info->pids);
     kfree(info->name);
 }
 
@@ -180,11 +186,29 @@ static void append_to_output_buffer(const char *data, size_t data_size)
 void append_process_info_to_output(struct process_info *info)
 {
     char info_buffer[512];
-    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d): \n",
+    struct process_info *tmp;
+
+    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d):",
                        info->name, info->total_pages, info->valid_pages, info->invalid_pages,
                        info->readonly_pages, info->readonly_groups, info->total_pids);
-
     append_to_output_buffer(info_buffer, len);
+
+    tmp = info;
+    while (tmp != NULL)
+    {
+        char pid_buffer[32];
+        int pid_len = snprintf(pid_buffer, sizeof(pid_buffer), " %u", tmp->pid);
+        append_to_output_buffer(pid_buffer, pid_len);
+        tmp = tmp->next;
+        if (!tmp)
+        {
+            append_to_output_buffer("\n", strlen("\n"));
+        }
+        else
+        {
+            append_to_output_buffer(";", strlen("\n"));
+        }
+    }
 }
 
 //////////////
@@ -201,7 +225,7 @@ void handle_reset(void)
 // Lists all processes and their memory info
 void handle_all(void)
 {
-    struct process_info *info;
+    struct process_info *info, *gathered_info;
     struct hlist_node *tmp;
     unsigned int bkt;
 
@@ -214,16 +238,15 @@ void handle_all(void)
 // Filters process info by name
 void handle_filter(const char *name)
 {
-    struct process_info *info = find_in_hash_table(name);
+    struct process_info *info = find_in_hash_table(name), *gathered_info;
     if (info != NULL)
     {
         append_process_info_to_output(info);
-        return;
     }
 }
 
 // Deletes all process info for a given name
-void handle_del(const char *name)
+void handle_del(const char *name) // TODO verify if it works
 {
     struct process_info *info = find_in_hash_table(name), *del = NULL;
     if (info != NULL)
@@ -373,6 +396,7 @@ static void __exit memory_info_exit(void)
     hash_for_each(process_hash_table, bkt, info, hnode)
     {
         remove_from_hash_table(info);
+        // TODO free
         /*while (info != NULL)
         {
             del = info;
