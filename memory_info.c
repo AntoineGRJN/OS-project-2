@@ -79,9 +79,9 @@ struct process_info *find_in_hash_table(char *name)
 void remove_from_hash_table(struct process_info *item)
 {
     hash_del(&item->hnode);
-    kfree(info->pids);
-    kfree(info->name);
-    kfree(info);
+    kfree(item->pids);
+    kfree(item->name);
+    kfree(item);
 }
 ////////////////////////////////////////////////////////////////
 
