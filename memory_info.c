@@ -14,7 +14,7 @@
 #define PROCFS_NAME "memory_info" // name of the proc entry
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
+MODULE_AUTHOR("Antoine Grosjean, Florent Hervers");
 MODULE_DESCRIPTION("Creates /proc entry with read/write functionality.");
 
 static char *message = NULL;
@@ -24,6 +24,8 @@ static struct proc_dir_entry *our_proc_file;
 
 #define HASH_TABLE_SIZE 16
 
+/// @brief Structure that stores all values about a set of processes
+/// with the same name.
 struct process_info
 {
     char *name;                    // Process name
@@ -38,6 +40,10 @@ struct process_info
     struct hlist_node hnode;
 };
 
+/// @brief Add the values of the item2 fields to the item1 ones
+/// @param item1 process_info stucture where values of fields will be gathered
+/// @param item2 process_info structure that will be added
+/// @return process info structure item1 with fields update according item2
 struct process_info *gather_items(struct process_info *item1, struct process_info *item2)
 {
     item1->total_pids += item2->total_pids;
@@ -52,8 +58,13 @@ struct process_info *gather_items(struct process_info *item1, struct process_inf
 // Hash Table //
 ////////////////
 
+/// @brief Define a hashtable of name [name] and size 2^[bits]
+/// @param  name
+/// @param  bits
 DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
 
+/// @brief Add a new item to the hasht table
+/// @param new_item process_info structure to add to the hash table
 void add_to_hash_table(struct process_info *new_item)
 {
     unsigned long hash = full_name_hash(NULL, new_item->name, strlen(new_item->name));
@@ -76,6 +87,9 @@ void add_to_hash_table(struct process_info *new_item)
     hash_add(process_hash_table, &new_item->hnode, hash);
 }
 
+/// @brief Look for items which name is [name]
+/// @param name string
+/// @return Items matching the name
 struct process_info *find_in_hash_table(char *name)
 {
     if (!name)
@@ -95,21 +109,24 @@ struct process_info *find_in_hash_table(char *name)
     return NULL; // No match found
 }
 
+/// @brief Remove an item from hash table
+/// @param item process_info structure to be removed
 void remove_from_hash_table(struct process_info *item)
 {
     hash_del(&item->hnode);
 }
 ////////////////////////////////////////////////////////////////
 
+// Buffer storing the output
 static char *output_buffer = NULL;
+// Size of the output buffer (can be resized if needed)
 static size_t output_buffer_size = 0;
-static size_t output_buffer_pos = 0; // Current position for reading
+// Current position for reading in the output buffer
+static size_t output_buffer_pos = 0;
 
-// static char output_buffer[4096]; // Buffer to store command output
-static int output_size = 0; // Size of the current output
-
-// Function to add process information to the hash table
-void add_process_info(struct task_struct *task)
+/// @brief Save the memory information of a process
+/// @param task Task we want to save the memory information
+void save_process_info(struct task_struct *task)
 {
     struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
     unsigned long valid_pages = 0;
@@ -139,12 +156,14 @@ void add_process_info(struct task_struct *task)
     add_to_hash_table(info);
 }
 
+/// @brief Free memory allocated to save process information
+/// @param info process_info structure to be freed
 void free_process_info(struct process_info *info)
 {
     kfree(info->name);
 }
 
-// Function to gather and populate process information
+/// @brief Gather and populate process information
 void gather_and_populate_data(void)
 {
     struct task_struct *task;
@@ -153,13 +172,15 @@ void gather_and_populate_data(void)
     {
         if (task->mm)
         { // Ensure the task has a memory descriptor
-            add_process_info(task);
+            save_process_info(task);
         }
     }
     rcu_read_unlock();
 }
 
-// Function to append data to the buffer
+/// @brief Append data to the output buffer
+/// @param data data to append
+/// @param data_size size of the data
 static void append_to_output_buffer(const char *data, size_t data_size)
 {
     if (output_buffer_pos + data_size >= output_buffer_size)
@@ -183,6 +204,8 @@ static void append_to_output_buffer(const char *data, size_t data_size)
     output_buffer_pos += data_size;
 }
 
+/// @brief Append memory information to the output buffer
+/// @param info process_info structure to be appened to the buffer
 void append_process_info_to_output(struct process_info *info)
 {
     char info_buffer[512];
@@ -215,14 +238,14 @@ void append_process_info_to_output(struct process_info *info)
 // Commands //
 //////////////
 
-// Resets the data structure and re-populates it
+/// @brief Reset the data structure and re-populates it
 void handle_reset(void)
 {
     // clear_data_structure();
     gather_and_populate_data();
 }
 
-// Lists all processes and their memory info
+/// @brief Lists all processes and their memory info
 void handle_all(void)
 {
     struct process_info *info, *gathered_info;
@@ -235,7 +258,8 @@ void handle_all(void)
     }
 }
 
-// Filters process info by name
+/// @brief Filters process_info by name
+/// @param name name used to filter process_info
 void handle_filter(const char *name)
 {
     struct process_info *info = find_in_hash_table(name), *gathered_info;
@@ -245,7 +269,8 @@ void handle_filter(const char *name)
     }
 }
 
-// Deletes all process info for a given name
+/// @brief Deletes all process_info for a given name
+/// @param name name of the process_info to be deleted
 void handle_del(const char *name) // TODO verify if it works
 {
     struct process_info *info = find_in_hash_table(name), *del = NULL;
@@ -267,10 +292,12 @@ void handle_del(const char *name) // TODO verify if it works
     }
 }
 
+/// @brief Parse the command given by user
+/// @param command string containing the given command
 void process_command(const char *command)
 {
-    output_buffer_size = 0;
-    output_buffer_pos = 0; // Reset output size
+    output_buffer_size = 0; // Reset output size
+    output_buffer_pos = 0;  // Reset output reader position
 
     if (strncmp(command, "RESET", 5) == 0)
     {
@@ -297,7 +324,7 @@ void process_command(const char *command)
 
 //////////////////////////////////////////////////////////////
 
-// Read operation for the /proc file
+/// @brief Read operation for the /proc file
 static ssize_t procfile_read(struct file *file, char __user *buffer, size_t count, loff_t *offset)
 {
     if (*offset >= output_buffer_pos)
@@ -312,7 +339,7 @@ static ssize_t procfile_read(struct file *file, char __user *buffer, size_t coun
     return to_copy;
 }
 
-// Write operation for the /proc file
+/// @brief Write operation for the /proc file
 static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
     char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
@@ -364,7 +391,7 @@ static struct file_operations proc_file_operations = {
     .llseek = seq_lseek,
 };
 
-// Initialize module
+/// @brief Initialize module
 static int __init memory_info_init(void)
 {
     hash_init(process_hash_table);
@@ -386,7 +413,7 @@ static int __init memory_info_init(void)
     return 0;
 }
 
-// Cleanup module
+/// @brief Cleanup module
 static void __exit memory_info_exit(void)
 {
     struct process_info *info, *del;
