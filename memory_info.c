@@ -8,6 +8,7 @@
 #include <linux/kernel.h>       // kernel logging
 #include <linux/sched/signal.h> // For task_struct and process iteration
 #include <linux/mm.h>
+#include <linux/mm_types.h>
 #include <linux/hashtable.h>
 #include <linux/string.h>
 
@@ -124,6 +125,46 @@ static size_t output_buffer_size = 0;
 // Current position for reading in the output buffer
 static size_t output_buffer_pos = 0;
 
+int print_page_info(pte_t *pte, unsigned long addr, unsigned long next, struct mm_walk *walk){
+    
+    struct page* page = pte_val(*pte);
+    printk(KERN_INFO "Page frame number: %lu\n", page_to_pfn(page));
+    return 0;
+}
+
+
+// Loop over every page
+void loop_over_process_pages(struct task_struct *task)
+{
+    struct mm_struct *mm = task->mm;
+    struct vm_area_struct *vma;
+    struct page *page;
+    unsigned long address;
+
+    if (!mm) {
+        printk(KERN_INFO "No memory management structure for the process.\n");
+        return;
+    }
+
+    down_read(&mm->mmap_sem); // Lock the memory map semaphore
+
+    struct mm_walk walk = {
+		.pte_entry = print_page_info,
+        .mm = mm,
+	};
+    
+    unsigned long start_address = mm->mmap->vm_start;
+    unsigned long end_address = mm->mmap->vm_end;
+
+    // Call walk_page_range() to iterate over the process's address space
+    walk_page_range(start_address, end_address, &walk);
+
+
+    up_read(&mm->mmap_sem); // Release the memory map semaphore
+}
+
+
+
 /// @brief Save the memory information of a process
 /// @param task Task we want to save the memory information
 void save_process_info(struct task_struct *task)
@@ -141,6 +182,7 @@ void save_process_info(struct task_struct *task)
     info->total_pages = get_mm_rss(task->mm);
     if (task->mm)
     {
+        loop_over_process_pages(task);
         valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
@@ -151,7 +193,7 @@ void save_process_info(struct task_struct *task)
     info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
     info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
     info->next = NULL;
-
+    
     // Insert into the hash table
     add_to_hash_table(info);
 }
