@@ -200,6 +200,13 @@ int save_process_info(struct task_struct *task)
     }
     // Initialize the struct
     info->name = kstrdup(task->comm, GFP_KERNEL);
+    if (!info->name)
+    {
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_file("[ERROR] Memory allocation error\n");
+        return -1;
+    }
     info->pid = task->pid;
     info->total_pids = 1;
     info->total_pages = get_mm_rss(task->mm);
@@ -236,6 +243,27 @@ int gather_and_populate_data(void)
     }
     rcu_read_unlock();
     return 0;
+}
+
+/// @brief Clear the hash table and free all allocated memory
+void clear_data_structure(void)
+{
+    struct process_info *info, *tmp, *del;
+    unsigned int bkt;
+
+    hash_for_each(process_hash_table, bkt, info, hnode)
+    {
+        tmp = info->next;
+        while (tmp != NULL)
+        {
+            del = tmp;
+            tmp = tmp->next;
+            free_process_info(del);
+            kfree(del);
+        }
+        remove_from_hash_table(info);
+        kfree(info);
+    }
 }
 
 /// @brief Append memory information to the output buffer
@@ -281,8 +309,10 @@ int append_process_info_to_output(struct process_info *info)
 /// @brief Reset the data structure and re-populates it
 int handle_reset(void)
 {
-    // clear_data_structure();
+    clear_data_structure();
     if (gather_and_populate_data())
+        return -1;
+    if (print_file("[SUCCESS]\n"))
         return -1;
     return 0;
 }
@@ -491,25 +521,7 @@ static int __init memory_info_init(void)
 /// @brief Cleanup module
 static void __exit memory_info_exit(void)
 {
-    struct process_info *info;
-    unsigned int bkt;
-
-    hash_for_each(process_hash_table, bkt, info, hnode)
-    {
-        remove_from_hash_table(info);
-        // TODO free
-        /*while (info != NULL)
-        {
-            del = info;
-            info = info->next;
-            printk(del->name);
-            remove_from_hash_table(del);
-            printk(del->name);
-            free_process_info(del);
-            kfree(del);
-            printk('nice');
-        }*/
-    }
+    clear_data_structure();
 
     // Remove proc entry
     remove_proc_entry(PROCFS_NAME, NULL);
