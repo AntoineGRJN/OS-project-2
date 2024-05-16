@@ -10,6 +10,7 @@
 #include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/hashtable.h>
+#include <linux/list.h>
 #include <linux/string.h>
 
 #define PROCFS_NAME "memory_info" // name of the proc entry
@@ -125,42 +126,70 @@ static size_t output_buffer_size = 0;
 // Current position for reading in the output buffer
 static size_t output_buffer_pos = 0;
 
-int print_page_info(pte_t *pte, unsigned long addr, unsigned long next, struct mm_walk *walk){
-    
-    struct page* page = pte_val(*pte);
-    printk(KERN_INFO "Page frame number: %lu\n", page_to_pfn(page));
-    return 0;
-}
+struct page_ref {
+    struct list_head list;
+    struct page *page;
+};
 
-
-// Loop over every page
-void loop_over_process_pages(struct task_struct *task)
+/**
+ * @brief given the intial_process, find if there are identical readable pages and append the value to the given struct
+*/
+static void find_duplicates(struct process_info *initial_process)
 {
-    struct mm_struct *mm = task->mm;
+    LIST_HEAD(readable_pages);
+    struct mm_struct *mm;
+    struct pid *pid_struct;
     struct vm_area_struct *vma;
     struct page *page;
+    int i;
     unsigned long address;
+    struct process_info * process;
 
-    if (!mm) {
-        printk(KERN_INFO "No memory management structure for the process.\n");
-        return;
+    process = initial_process;
+    // Iterate on every task
+    for (i = 0; i < process->total_pids; i++) {
+        pid_struct = find_get_pid(process->pid);
+        mm = pid_task(pid_struct, PIDTYPE_PID)->mm;
+        if (!mm) {
+            printk(KERN_INFO "No memory management structure for the process.\n");
+            return;
+        }
+
+        // Lock the memory map semaphore
+        down_read(&mm->mmap_sem); 
+
+        for (vma = mm->mmap; vma; vma = vma->vm_next) {
+            // Don't append the pages if they don't have the read authorization
+            if (! vma->vm_flags | VM_READ){
+                continue;
+            }
+
+            // Walk into the pages tables to find the pages
+            for (address = vma->vm_start; address < vma->vm_end; address += PAGE_SIZE) {
+                // Get the page table entry for the current address
+                pgd_t *pgd = pgd_offset(mm, address);
+                p4d_t* p4d = p4d_offset(pgd, address);
+                pud_t *pud = pud_offset(p4d, address);
+                pmd_t *pmd = pmd_offset(pud, address);
+                pte_t *pte = pte_offset_map(pmd, address);
+
+                // Append the page to the list if we found it
+                if (pte && pte_present(*pte)) {
+                    struct page_ref* elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
+                    elem->page = pte_page(*pte);
+                    list_add_tail(&elem->list, &readable_pages);
+                    pte_unmap(pte);
+                }
+
+            }
+        }
+        up_read(&mm->mmap_sem); // Release the memory map semaphore
+        
     }
 
-    down_read(&mm->mmap_sem); // Lock the memory map semaphore
-
-    struct mm_walk walk = {
-		.pte_entry = print_page_info,
-        .mm = mm,
-	};
-    
-    unsigned long start_address = mm->mmap->vm_start;
-    unsigned long end_address = mm->mmap->vm_end;
-
-    // Call walk_page_range() to iterate over the process's address space
-    walk_page_range(start_address, end_address, &walk);
-
-
-    up_read(&mm->mmap_sem); // Release the memory map semaphore
+    //TODO: from the list readable_pages and determine the nb_of_group
+    //TODO: append the result to the process info data structure
+    return;
 }
 
 
@@ -181,8 +210,7 @@ void save_process_info(struct task_struct *task)
     info->total_pids = 1;
     info->total_pages = get_mm_rss(task->mm);
     if (task->mm)
-    {
-        loop_over_process_pages(task);
+    {   
         valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
@@ -196,6 +224,9 @@ void save_process_info(struct task_struct *task)
     
     // Insert into the hash table
     add_to_hash_table(info);
+
+    // TODO: integrate this function at the right place
+    find_duplicates(info);
 }
 
 /// @brief Free memory allocated to save process information
@@ -261,6 +292,7 @@ void append_process_info_to_output(struct process_info *info)
     tmp = info;
     while (tmp != NULL)
     {
+        // TODO: check if 32 is enough
         char pid_buffer[32];
         int pid_len = snprintf(pid_buffer, sizeof(pid_buffer), " %u", tmp->pid);
         append_to_output_buffer(pid_buffer, pid_len);
