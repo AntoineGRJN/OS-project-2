@@ -275,6 +275,7 @@ static void find_duplicates(struct process_info *initial_process)
     for (i = 0; i < process->total_pids; i++)
     {
         pid_struct = find_get_pid(process->pid);
+        printk(KERN_INFO "Process Name : %s (pid = %d)", process->name, process->pid);
         mm = pid_task(pid_struct, PIDTYPE_PID)->mm;
         if (!mm)
         {
@@ -288,7 +289,7 @@ static void find_duplicates(struct process_info *initial_process)
         for (vma = mm->mmap; vma; vma = vma->vm_next)
         {
             // Don't append the pages if they don't have the read authorization
-            if (!vma->vm_flags | VM_READ)
+            if (!vma->vm_flags & VM_READ)
             {
                 continue;
             }
