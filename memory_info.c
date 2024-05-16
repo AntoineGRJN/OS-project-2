@@ -24,6 +24,8 @@ static struct proc_dir_entry *our_proc_file;
 
 #define HASH_TABLE_SIZE 16
 
+static int err = 0;
+
 /// @brief Structure that stores all values about a set of processes
 /// with the same name.
 struct process_info
@@ -124,36 +126,11 @@ static size_t output_buffer_size = 0;
 // Current position for reading in the output buffer
 static size_t output_buffer_pos = 0;
 
-/// @brief Save the memory information of a process
-/// @param task Task we want to save the memory information
-void save_process_info(struct task_struct *task)
+/// @brief Reset and clear the output buffer
+void reset_output_buffer(void)
 {
-    struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
-    unsigned long valid_pages = 0;
-
-    if (!info)
-        return -ENOMEM; // Handle kmalloc failure
-
-    // Initialize the struct
-    info->name = kstrdup(task->comm, GFP_KERNEL);
-    info->pid = task->pid;
-    info->total_pids = 1;
-    info->total_pages = get_mm_rss(task->mm);
-    if (task->mm)
-    {
-        valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
-                      atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
-                      atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
-    }
-
-    info->valid_pages = valid_pages;                             // Example for valid pages
-    info->invalid_pages = info->total_pages - info->valid_pages; // Simplified calculation
-    info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
-    info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
-    info->next = NULL;
-
-    // Insert into the hash table
-    add_to_hash_table(info);
+    output_buffer_size = 0;
+    output_buffer_pos = 0;
 }
 
 /// @brief Free memory allocated to save process information
@@ -181,7 +158,7 @@ void gather_and_populate_data(void)
 /// @brief Append data to the output buffer
 /// @param data data to append
 /// @param data_size size of the data
-static void append_to_output_buffer(const char *data, size_t data_size)
+static int append_to_output_buffer(const char *data, size_t data_size)
 {
     if (output_buffer_pos + data_size >= output_buffer_size)
     {
@@ -193,20 +170,71 @@ static void append_to_output_buffer(const char *data, size_t data_size)
         char *new_buffer = krealloc(output_buffer, new_size, GFP_KERNEL);
         if (!new_buffer)
         {
-            printk(KERN_ERR "Failed to expand output buffer\n");
-            return;
+            err = -ENOMEN;
+            printk(KERN_ERR "[ERROR] Memory allocation error\n");
+            reset_output_buffer();
+            append_to_output_buffer("[ERROR] Memory allocation error\n", strlen("[ERROR] Memory allocation error\n"));
+            return -1;
         }
         output_buffer = new_buffer;
         output_buffer_size = new_size;
+        return 0;
     }
 
     memcpy(output_buffer + output_buffer_pos, data, data_size);
     output_buffer_pos += data_size;
 }
 
+int print_file(char *error_message) // TODO err
+{
+    reset_output_buffer();
+    if (append_to_output_buffer(error_message, strlen(error_message)))
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/// @brief Save the memory information of a process
+/// @param task Task we want to save the memory information
+int save_process_info(struct task_struct *task)
+{
+    struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
+    unsigned long valid_pages = 0;
+
+    if (!info)
+    {
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_file("[ERROR] Memory allocation error\n");
+        return -1;
+    }
+    // Initialize the struct
+    info->name = kstrdup(task->comm, GFP_KERNEL);
+    info->pid = task->pid;
+    info->total_pids = 1;
+    info->total_pages = get_mm_rss(task->mm);
+    if (task->mm)
+    {
+        valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
+                      atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
+                      atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
+    }
+
+    info->valid_pages = valid_pages;                             // Example for valid pages
+    info->invalid_pages = info->total_pages - info->valid_pages; // Simplified calculation
+    info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
+    info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
+    info->next = NULL;
+
+    // Insert into the hash table
+    add_to_hash_table(info);
+    return 0;
+}
+
 /// @brief Append memory information to the output buffer
 /// @param info process_info structure to be appened to the buffer
-void append_process_info_to_output(struct process_info *info)
+int append_process_info_to_output(struct process_info *info) // TODO err
 {
     char info_buffer[512];
     struct process_info *tmp;
@@ -214,24 +242,37 @@ void append_process_info_to_output(struct process_info *info)
     int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d):",
                        info->name, info->total_pages, info->valid_pages, info->invalid_pages,
                        info->readonly_pages, info->readonly_groups, info->total_pids);
-    append_to_output_buffer(info_buffer, len);
+    if (append_to_output_buffer(info_buffer, len))
+    {
+        return -1;
+    }
 
     tmp = info;
     while (tmp != NULL)
     {
         char pid_buffer[32];
         int pid_len = snprintf(pid_buffer, sizeof(pid_buffer), " %u", tmp->pid);
-        append_to_output_buffer(pid_buffer, pid_len);
+        if (append_to_output_buffer(pid_buffer, pid_len))
+        {
+            return -1;
+        }
         tmp = tmp->next;
         if (!tmp)
         {
-            append_to_output_buffer("\n", strlen("\n"));
+            if (append_to_output_buffer("\n", strlen("\n")))
+            {
+                return -1;
+            }
         }
         else
         {
-            append_to_output_buffer(";", strlen("\n"));
+            if (append_to_output_buffer(";", strlen("\n")))
+            {
+                return -1;
+            }
         }
     }
+    return 0;
 }
 
 //////////////
@@ -271,7 +312,7 @@ void handle_filter(const char *name)
 
 /// @brief Deletes all process_info for a given name
 /// @param name name of the process_info to be deleted
-void handle_del(const char *name) // TODO verify if it works
+int handle_del(const char *name) // TODO verify if it works //TODO err
 {
     struct process_info *info = find_in_hash_table(name), *del = NULL;
     if (info != NULL)
@@ -284,25 +325,30 @@ void handle_del(const char *name) // TODO verify if it works
             free_process_info(del);
             kfree(del);
         }
-        append_to_output_buffer("[SUCCESS]\n", strlen("[SUCCESS]\n"));
+        if (print_file("[SUCCESS]\n"))
+        {
+            return -1;
+        }
     }
     else
     {
-        append_to_output_buffer("[ERROR]: No such process\n", strlen("[ERROR]: No such process\n"));
+        if (print_file("[ERROR]: No such process\n"))
+            return -1;
     }
+    return 0;
 }
 
 /// @brief Parse the command given by user
 /// @param command string containing the given command
-void process_command(const char *command)
+int process_command(const char *command) // TODO err
 {
-    output_buffer_size = 0; // Reset output size
-    output_buffer_pos = 0;  // Reset output reader position
+    reset_output_buffer();
 
     if (strncmp(command, "RESET", 5) == 0)
     {
         handle_reset();
-        append_to_output_buffer("[SUCCESS]\n", strlen("[SUCCESS]\n"));
+        if (print_file("[SUCCESS]\n"))
+            return -1;
     }
     else if (strncmp(command, "ALL", 3) == 0)
     {
@@ -318,8 +364,10 @@ void process_command(const char *command)
     }
     else
     {
-        append_to_output_buffer("[ERROR]: Unknown command\n", strlen("[ERROR]: Unknown command\n"));
+        if (print_file("[ERROR]: Unknown command\n"))
+            return -1;
     }
+    return 0;
 }
 
 //////////////////////////////////////////////////////////////
@@ -345,6 +393,8 @@ static ssize_t procfile_write(struct file *file, const char __user *buffer, size
     char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
     if (!command_buffer)
     {
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_file("[ERROR] Memory allocation error\n");
         return -ENOMEM;
     }
 
