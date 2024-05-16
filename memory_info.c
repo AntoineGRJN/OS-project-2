@@ -12,6 +12,9 @@
 #include <linux/hashtable.h>
 #include <linux/list.h>
 #include <linux/string.h>
+#include <asm/highmem.h>
+#include <linux/crypto.h>
+#include <crypto/hash.h>
 
 #define PROCFS_NAME "memory_info" // name of the proc entry
 
@@ -25,6 +28,8 @@ static char *message = NULL;
 static struct proc_dir_entry *our_proc_file;
 
 #define HASH_TABLE_SIZE 16
+#define FIXED_PAGE_SIZE 4096
+#define SHA256_DIGEST_LENGTH 8
 
 static int err = 0;
 
@@ -131,15 +136,127 @@ static size_t output_buffer_size = 0;
 // Current position for reading in the output buffer
 static size_t output_buffer_pos = 0;
 
-
-struct page_ref {
+struct page_ref
+{
     struct list_head list;
     struct page *page;
 };
 
+struct hash_entry
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    int count; // Number of identical pages
+    struct list_head list;
+};
+
+LIST_HEAD(hashed_readable_pages_list);
+
+// If we decide to compare pages instead of hash
+/*int compare_pages(struct page *page1, struct page *page2) {
+    void *kaddr1, *kaddr2;
+    int result;
+
+    // Map the pages into kernel address space
+    kaddr1 = kmap(page1);
+    kaddr2 = kmap(page2);
+
+    // Compare the contents
+    result = memcmp(kaddr1, kaddr2, PAGE_SIZE);
+
+    // Unmap the pages
+    kunmap(page1);
+    kunmap(page2);
+
+    return result;
+}*/
+
+struct hash_entry *add_hashed_readable_page(unsigned char *hash)
+{
+    struct hash_entry *entry;
+    list_for_each_entry(entry, &hashed_readable_pages_list, list)
+    {
+        if (memcmp(entry->hash, hash, SHA256_DIGEST_LENGTH) == 0)
+        {
+            return entry;
+        }
+    }
+    entry = kmalloc(sizeof(struct hash_entry), GFP_KERNEL); // TODO allocation error
+    if (!entry)
+        return NULL;
+    memcpy(entry->hash, hash, SHA256_DIGEST_LENGTH);
+    entry->count = 1;
+    INIT_LIST_HEAD(&entry->list);
+    list_add(&entry->list, &hashed_readable_pages_list);
+    return entry;
+}
+
+int count_readable_groups(struct page_ref *pages, int readable_pages)
+{
+    int group_count = 0;
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    int i;
+
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm))
+    {
+        pr_err("Failed to allocate shash\n");
+        return PTR_ERR(tfm);
+    }
+
+    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL); // TODO allocation error
+    if (!desc)
+    {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+    desc->tfm = tfm;
+
+    for (i = 0; i < readable_pages; i++)
+    {
+        unsigned char *kaddr;
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+
+        kaddr = kmap(pages[i].page);
+        crypto_shash_init(desc);
+        crypto_shash_update(desc, kaddr, FIXED_PAGE_SIZE);
+        crypto_shash_final(desc, hash);
+        kunmap(pages[i].page);
+
+        struct hash_entry *entry = add_hashed_readable_page(hash);
+        if (entry)
+        {
+            entry->count++;
+        }
+    }
+
+    // Count the number of groups of identical pages
+    struct hash_entry *entry;
+    list_for_each_entry(entry, &hashed_readable_pages_list, list)
+    {
+        if (entry->count > 1)
+        {
+            group_count++;
+        }
+    }
+
+    kfree(desc);
+    crypto_free_shash(tfm);
+
+    // Free the hash list
+    while (!list_empty(&hashed_readable_pages_list))
+    {
+        entry = list_first_entry(&hashed_readable_pages_list, struct hash_entry, list);
+        list_del(&entry->list);
+        kfree(entry);
+    }
+
+    return group_count;
+}
+
 /**
  * @brief given the intial_process, find if there are identical readable pages and append the value to the given struct
-*/
+ */
 static void find_duplicates(struct process_info *initial_process)
 {
     LIST_HEAD(readable_pages);
@@ -149,56 +266,69 @@ static void find_duplicates(struct process_info *initial_process)
     struct page *page;
     int i;
     unsigned long address;
-    struct process_info * process;
+    struct process_info *process;
+    int nb = 0;
+    struct list_head *pos;
 
     process = initial_process;
     // Iterate on every task
-    for (i = 0; i < process->total_pids; i++) {
+    for (i = 0; i < process->total_pids; i++)
+    {
         pid_struct = find_get_pid(process->pid);
         mm = pid_task(pid_struct, PIDTYPE_PID)->mm;
-        if (!mm) {
+        if (!mm)
+        {
             printk(KERN_INFO "No memory management structure for the process.\n");
             return;
         }
 
         // Lock the memory map semaphore
-        down_read(&mm->mmap_sem); 
+        down_read(&mm->mmap_sem);
 
-        for (vma = mm->mmap; vma; vma = vma->vm_next) {
+        for (vma = mm->mmap; vma; vma = vma->vm_next)
+        {
             // Don't append the pages if they don't have the read authorization
-            if (! vma->vm_flags | VM_READ){
+            if (!vma->vm_flags | VM_READ)
+            {
                 continue;
             }
 
             // Walk into the pages tables to find the pages
-            for (address = vma->vm_start; address < vma->vm_end; address += PAGE_SIZE) {
+            for (address = vma->vm_start; address < vma->vm_end; address += FIXED_PAGE_SIZE)
+            {
                 // Get the page table entry for the current address
                 pgd_t *pgd = pgd_offset(mm, address);
-                p4d_t* p4d = p4d_offset(pgd, address);
+                p4d_t *p4d = p4d_offset(pgd, address);
                 pud_t *pud = pud_offset(p4d, address);
                 pmd_t *pmd = pmd_offset(pud, address);
                 pte_t *pte = pte_offset_map(pmd, address);
 
                 // Append the page to the list if we found it
-                if (pte && pte_present(*pte)) {
-                    struct page_ref* elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
+                if (pte && pte_present(*pte))
+                {
+                    struct page_ref *elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
                     elem->page = pte_page(*pte);
                     list_add_tail(&elem->list, &readable_pages);
                     pte_unmap(pte);
                 }
-
             }
         }
         up_read(&mm->mmap_sem); // Release the memory map semaphore
-        
     }
 
-    //TODO: from the list readable_pages and determine the nb_of_group
-    //TODO: append the result to the process info data structure
+    if (list_empty(&readable_pages))
+        printk(KERN_INFO "EMPTY");
+
+    list_for_each(pos, &readable_pages)
+    {
+        nb += 1;
+    }
+    printk(KERN_INFO "%d", nb);
+
+    // TODO: from the list readable_pages and determine the nb_of_group
+    // TODO: append the result to the process info data structure
     return;
 }
-
-
 
 /// @brief Reset and clear the output buffer
 void reset_output_buffer(void)
@@ -255,7 +385,6 @@ int print_file(char *error_message)
     return 0;
 }
 
-
 /// @brief Save the memory information of a process
 /// @param task Task we want to save the memory information
 int save_process_info(struct task_struct *task)
@@ -295,12 +424,14 @@ int save_process_info(struct task_struct *task)
     info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
     info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
     info->next = NULL;
-    
+
     // Insert into the hash table
     add_to_hash_table(info);
 
     // TODO: integrate this function at the right place
     find_duplicates(info);
+
+    return 0;
 }
 
 /// @brief Gather and populate process information
