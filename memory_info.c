@@ -209,9 +209,9 @@ int save_process_info(struct task_struct *task)
     }
     info->pid = task->pid;
     info->total_pids = 1;
-    info->total_pages = get_mm_rss(task->mm);
     if (task->mm)
     {
+        info->total_pages = task->mm->total_vm;
         valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
                       atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
