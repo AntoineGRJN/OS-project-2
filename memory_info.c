@@ -336,11 +336,16 @@ int handle_all(void)
 int handle_filter(char *name)
 {
     struct process_info *info = find_in_hash_table(name);
-    if (info != NULL)
+    if (!info)
     {
-        if (append_process_info_to_output(info))
+        err = -ESRCH;
+        printk(KERN_ERR "[ERROR]: No such process\n");
+        if (print_file("[ERROR]: No such process\n"))
             return -1;
+        return -1;
     }
+    if (append_process_info_to_output(info))
+        return -1;
     return 0;
 }
 
@@ -348,17 +353,20 @@ int handle_filter(char *name)
 /// @param name name of the process_info to be deleted
 int handle_del(char *name) // TODO verify if it works
 {
-    struct process_info *info = find_in_hash_table(name), *del = NULL;
+    struct process_info *info = find_in_hash_table(name), *tmp, *del;
     if (info != NULL)
     {
-        while (info != NULL)
+        tmp = info->next;
+        while (tmp != NULL)
         {
-            del = info;
-            info = info->next;
-            remove_from_hash_table(del);
+            del = tmp;
+            tmp = tmp->next;
             free_process_info(del);
             kfree(del);
         }
+        remove_from_hash_table(info);
+        kfree(info);
+
         if (print_file("[SUCCESS]\n"))
             return -1;
     }
@@ -437,7 +445,7 @@ static ssize_t procfile_read(struct file *file, char __user *buffer, size_t coun
 }
 
 /// @brief Write operation for the /proc file
-static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
+static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset) // TODO return message and not error
 {
     char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
     if (!command_buffer)
