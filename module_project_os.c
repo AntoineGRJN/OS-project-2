@@ -550,7 +550,7 @@ static int append_to_output_buffer(const char *data, size_t data_size)
             printk(KERN_ERR "[ERROR] Memory allocation error\n");
             reset_output_buffer();
             append_to_output_buffer("[ERROR] Memory allocation error\n", strlen("[ERROR] Memory allocation error\n"));
-            return -1;
+            return err;
         }
         output_buffer = new_buffer;
         output_buffer_size = new_size;
@@ -558,7 +558,6 @@ static int append_to_output_buffer(const char *data, size_t data_size)
 
     memcpy(output_buffer + output_buffer_pos, data, data_size);
     output_buffer_pos += data_size;
-    kfree(data);
     return 0;
 }
 
@@ -680,11 +679,13 @@ int append_process_info_to_output(struct process_info *info)
     char message[] = "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):";
     
     // Compute the required length of the string containing all infos but the pid's
-    stringLength = snprintf(NULL, 0, message,
+    stringLength = 1024; /*snprintf(NULL, 0, message,
                     info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-                    info->readonly_pages, info->readonly_groups, info->total_pids);
-    
-    info_buffer = kmalloc(sizeof(char) * stringLength, GFP_KERNEL);
+                    info->readonly_pages, info->readonly_groups, info->total_pids);*/
+    printk(KERN_INFO "Given: length: %d\n", snprintf(NULL, 0, message,
+                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+                    info->readonly_pages, info->readonly_groups, info->total_pids));
+    info_buffer = kmalloc(sizeof(char) * (stringLength + 1) , GFP_KERNEL);
     if (info_buffer == NULL){
         err = -ENOMEM;
         printk(KERN_ERR "[ERROR] Memory allocation error\n");
@@ -708,6 +709,7 @@ int append_process_info_to_output(struct process_info *info)
     if (append_to_output_buffer(info_buffer, stringLength))
         goto free_and_return;
 
+    kfree(info_buffer);
     tmp = info;
     while (tmp != NULL)
     {
