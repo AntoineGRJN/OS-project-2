@@ -1,4 +1,4 @@
-obj-m += memory_info.o 
+obj-m += module_project_os.o 
 
 ccflags-y += -O0
 

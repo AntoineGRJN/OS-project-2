@@ -405,6 +405,8 @@ static void find_duplicates(struct process_info *initial_process)
     struct process_info *process;
     int nb = 0;
     struct list_head *pos;
+    // Counter to keep track of valid_pages
+    int valid_pages = 0;
 
     process = initial_process;
     // Iterate on every task
@@ -424,12 +426,6 @@ static void find_duplicates(struct process_info *initial_process)
 
         for (vma = mm->mmap; vma; vma = vma->vm_next)
         {
-            // Don't append the pages if they don't have the read authorization
-            if (!(vma->vm_flags & VM_READ))
-            {
-                continue;
-            }
-
             // Walk into the pages tables to find the pages
             for (address = vma->vm_start; address < vma->vm_end; address += FIXED_PAGE_SIZE)
             {
@@ -455,27 +451,42 @@ static void find_duplicates(struct process_info *initial_process)
                 if (!pte || pte_none(*pte))
                     continue;
 
-                // Append the page to the list if we found it
+                // Append the page to the list if we found it + append the pages only if they have the read authorization
+        
                 if (pte_present(*pte))
                 {
-                    struct page_ref *elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
-                    if (!elem)
-                        continue;
-                    elem->page = pte_page(*pte);
-                    if (elem->page && !PageReserved(elem->page))
+                    valid_pages += 1;
+                    if (vma->vm_flags & VM_READ) 
                     {
-                        spin_lock(&readable_pages_lock);
-                        INIT_LIST_HEAD(&elem->list);
-                        list_add_tail(&elem->list, &readable_pages);
-                        spin_unlock(&readable_pages_lock);
+                        struct page_ref *elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
+                        if (!elem)
+                            continue;
+                        elem->page = pte_page(*pte);
+                        if (elem->page && !PageReserved(elem->page))
+                        {
+                            spin_lock(&readable_pages_lock);
+                            INIT_LIST_HEAD(&elem->list);
+                            list_add_tail(&elem->list, &readable_pages);
+                            spin_unlock(&readable_pages_lock);
+                        }
                     }
-                }
+                } 
                 pte_unmap(pte);
             }
         }
         up_read(&mm->mmap_sem); // Release the memory map semaphore
         process = process->next;
     }
+
+    // Update the statistics contained in the structure
+    process = initial_process;
+    while (process != NULL)
+    {
+        process->valid_pages = valid_pages;
+        process->invalid_pages = process->total_pages - process->valid_pages;
+        process = process->next;
+    }
+
     spin_lock(&readable_pages_lock);
     list_for_each(pos, &readable_pages)
     {
@@ -585,13 +596,10 @@ int save_process_info(struct task_struct *task)
 
     {
         info->total_pages = task->mm->total_vm;
-        valid_pages = atomic_long_read(&task->mm->rss_stat.count[MM_FILEPAGES]) +
-                      atomic_long_read(&task->mm->rss_stat.count[MM_ANONPAGES]) +
-                      atomic_long_read(&task->mm->rss_stat.count[MM_SHMEMPAGES]);
     }
 
-    info->valid_pages = valid_pages;                             // Example for valid pages
-    info->invalid_pages = info->total_pages - info->valid_pages; // Simplified calculation
+    info->valid_pages = 0;                             // Example for valid pages
+    info->invalid_pages = 0; // Simplified calculation
     info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
     info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
     info->next = NULL;
@@ -664,7 +672,7 @@ int append_process_info_to_output(struct process_info *info)
     char info_buffer[512];
     struct process_info *tmp;
 
-    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may be shared: %lu, nb group: %lu, pid(%d):",
+    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):",
                        info->name, info->total_pages, info->valid_pages, info->invalid_pages,
                        info->readonly_pages, info->readonly_groups, info->total_pids);
     if (append_to_output_buffer(info_buffer, len))
