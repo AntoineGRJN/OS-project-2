@@ -194,7 +194,7 @@ struct hash_entry *add_hashed_readable_page(unsigned char *hash)
     return entry;
 }
 
-int count_readable_groups(struct process_info *initial_process)
+/*int count_readable_groups(struct process_info *initial_process)
 {
     int may_be_shared = 0;
     int group_count = 0;
@@ -240,6 +240,111 @@ int count_readable_groups(struct process_info *initial_process)
     spin_unlock(&readable_pages_lock);
 
     printk(KERN_INFO "finish");
+
+    // Count the number of groups of identical pages
+    spin_lock(&hashed_readable_pages_lock);
+    struct hash_entry *entry;
+    list_for_each_entry(entry, &hashed_readable_pages_list, list)
+    {
+        if (entry->count > 1)
+        {
+            may_be_shared += entry->count;
+            group_count++;
+        }
+        else
+        {
+            printk(KERN_INFO "loop: %d", entry->count);
+        }
+    }
+    spin_unlock(&hashed_readable_pages_lock);
+
+    initial_process->readonly_pages = may_be_shared;
+    initial_process->readonly_groups = group_count;
+    printk(KERN_INFO "may be shared: %d", may_be_shared);
+    printk(KERN_INFO "groups: %d", group_count);
+
+    kfree(desc);
+    crypto_free_shash(tfm);
+
+    printk(KERN_INFO "start free");
+    // Free the hash list
+    spin_lock(&hashed_readable_pages_lock);
+    struct hash_entry *e;
+    struct hash_entry *s;
+    list_for_each_entry_safe(e, s, &hashed_readable_pages_list, list)
+    {
+        list_del(&e->list);
+        kfree(e);
+    }
+    spin_unlock(&hashed_readable_pages_lock);
+
+    if (list_empty(&hashed_readable_pages_list))
+    {
+        printk(KERN_INFO "freed");
+    }
+    printk(KERN_INFO "return");
+    return 0;
+}
+*/
+
+static int count_readable_groups(struct process_info *initial_process)
+{
+    int may_be_shared = 0;
+    int group_count = 0;
+    struct crypto_shash *tfm;
+    struct shash_desc *desc;
+    struct page_ref *page;
+    int i = 0;
+
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm))
+    {
+        pr_err("Failed to allocate shash\n");
+        return PTR_ERR(tfm);
+    }
+
+    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+    if (!desc)
+    {
+        crypto_free_shash(tfm);
+        return -ENOMEM;
+    }
+    desc->tfm = tfm;
+
+    spin_lock(&readable_pages_lock);
+    list_for_each_entry(page, &readable_pages, list)
+    {
+        unsigned char *kaddr;
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+
+        if (!page || !page->page) {
+            pr_err("Invalid page entry\n");
+            continue;
+        }
+
+        printk(KERN_INFO "Processing page: %d", i);
+        kaddr = kmap(page->page);
+        if (!kaddr) {
+            pr_err("Failed to map page\n");
+            continue;
+        }
+
+        crypto_shash_init(desc);
+        crypto_shash_update(desc, kaddr, FIXED_PAGE_SIZE);
+        crypto_shash_final(desc, hash);
+        kunmap(page->page);
+        printk(KERN_INFO "Completed page: %d", i);
+
+        struct hash_entry *entry = add_hashed_readable_page(hash);
+        if (entry)
+        {
+            entry->count++;
+        }
+        i++;
+    }
+    spin_unlock(&readable_pages_lock);
+
+    printk(KERN_INFO "Finished processing pages");
 
     // Count the number of groups of identical pages
     spin_lock(&hashed_readable_pages_lock);
@@ -503,14 +608,17 @@ int gather_and_populate_data(void)
     struct task_struct *task;
     struct process_info *info;
     unsigned int bkt;
+    int err = 0;
 
     rcu_read_lock();
     for_each_process(task)
     {
         if (task->mm)
         { // Ensure the task has a memory descriptor
-            if (save_process_info(task))
-                return -1;
+            if (save_process_info(task)){
+                err = -1;
+                goto out;
+            }
         }
     }
 
@@ -521,8 +629,11 @@ int gather_and_populate_data(void)
         find_duplicates(info);
         printk(KERN_INFO "AFTER");
     }
+
+out:
     rcu_read_unlock();
-    return 0;
+    printk(KERN_INFO "gather_and_populate return code: %d", err);
+    return err;
 }
 
 /// @brief Clear the hash table and free all allocated memory
@@ -786,25 +897,31 @@ static struct file_operations proc_file_operations = {
 /// @brief Initialize module
 static int __init memory_info_init(void)
 {
+    int err = 0;
+
     hash_init(process_hash_table);
 
     // Create proc entry
     our_proc_file = proc_create(PROCFS_NAME, 0666, NULL, &proc_file_operations);
-    if (our_proc_file == NULL)
+    if (!our_proc_file)
     {
-        remove_proc_entry(PROCFS_NAME, NULL);
-        err = -ENOENT;
-        printk(KERN_ALERT "[ERROR] No such file or directory\n");
-        print_file("[ERROR] No such file or directory\n");
-        return err;
+        printk(KERN_ALERT "[ERROR] Could not create /proc/%s\n", PROCFS_NAME);
+        return -ENOENT;
     }
 
     printk(KERN_INFO "/proc/%s created\n", PROCFS_NAME);
 
     // Populate initial data
-    gather_and_populate_data();
+    err = gather_and_populate_data();
+    if (err)
+    {
+        printk(KERN_ALERT "[ERROR] gather_and_populate_data failed with error %d\n", err);
+        proc_remove(our_proc_file);
+        return err;
+    }
 
-    return err;
+    printk(KERN_INFO "gather_and_populate_data returned %d\n", err);
+    return 0;
 }
 
 /// @brief Cleanup module
