@@ -150,6 +150,10 @@ struct hash_entry
 };
 
 LIST_HEAD(hashed_readable_pages_list);
+LIST_HEAD(readable_pages);
+
+static DEFINE_SPINLOCK(readable_pages_lock);
+static DEFINE_SPINLOCK(hashed_readable_pages_lock);
 
 // If we decide to compare pages instead of hash
 /*int compare_pages(struct page *page1, struct page *page2) {
@@ -184,18 +188,20 @@ struct hash_entry *add_hashed_readable_page(unsigned char *hash)
     if (!entry)
         return NULL;
     memcpy(entry->hash, hash, SHA256_DIGEST_LENGTH);
-    entry->count = 1;
+    entry->count = 0;
     INIT_LIST_HEAD(&entry->list);
     list_add(&entry->list, &hashed_readable_pages_list);
     return entry;
 }
 
-int count_readable_groups(struct page_ref *pages, int readable_pages)
+int count_readable_groups(struct process_info *initial_process)
 {
+    int may_be_shared = 0;
     int group_count = 0;
     struct crypto_shash *tfm;
     struct shash_desc *desc;
-    int i;
+    struct page_ref *page;
+    int i = 0;
 
     tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(tfm))
@@ -212,46 +218,72 @@ int count_readable_groups(struct page_ref *pages, int readable_pages)
     }
     desc->tfm = tfm;
 
-    for (i = 0; i < readable_pages; i++)
+    spin_lock(&readable_pages_lock);
+    list_for_each_entry(page, &readable_pages, list)
     {
         unsigned char *kaddr;
         unsigned char hash[SHA256_DIGEST_LENGTH];
-
-        kaddr = kmap(pages[i].page);
+        printk(KERN_INFO "in: %d", i);
+        kaddr = kmap(page->page);
         crypto_shash_init(desc);
         crypto_shash_update(desc, kaddr, FIXED_PAGE_SIZE);
         crypto_shash_final(desc, hash);
-        kunmap(pages[i].page);
-
+        kunmap(page->page);
+        printk(KERN_INFO "out: %d", i);
         struct hash_entry *entry = add_hashed_readable_page(hash);
         if (entry)
         {
             entry->count++;
         }
+        i++;
     }
+    spin_unlock(&readable_pages_lock);
+
+    printk(KERN_INFO "finish");
 
     // Count the number of groups of identical pages
+    spin_lock(&hashed_readable_pages_lock);
     struct hash_entry *entry;
     list_for_each_entry(entry, &hashed_readable_pages_list, list)
     {
         if (entry->count > 1)
         {
+            may_be_shared += entry->count;
             group_count++;
         }
+        else
+        {
+            printk(KERN_INFO "loop: %d", entry->count);
+        }
     }
+    spin_unlock(&hashed_readable_pages_lock);
+
+    initial_process->readonly_pages = may_be_shared;
+    initial_process->readonly_groups = group_count;
+    printk(KERN_INFO "may be shared: %d", may_be_shared);
+    printk(KERN_INFO "groups: %d", group_count);
 
     kfree(desc);
     crypto_free_shash(tfm);
 
+    printk(KERN_INFO "start free");
     // Free the hash list
-    while (!list_empty(&hashed_readable_pages_list))
+    spin_lock(&hashed_readable_pages_lock);
+    struct hash_entry *e;
+    struct hash_entry *s;
+    list_for_each_entry_safe(e, s, &hashed_readable_pages_list, list)
     {
-        entry = list_first_entry(&hashed_readable_pages_list, struct hash_entry, list);
-        list_del(&entry->list);
-        kfree(entry);
+        list_del(&e->list);
+        kfree(e);
     }
+    spin_unlock(&hashed_readable_pages_lock);
 
-    return group_count;
+    if (list_empty(&hashed_readable_pages_list))
+    {
+        printk(KERN_INFO "freed");
+    }
+    printk(KERN_INFO "return");
+    return 0;
 }
 
 /**
@@ -259,7 +291,6 @@ int count_readable_groups(struct page_ref *pages, int readable_pages)
  */
 static void find_duplicates(struct process_info *initial_process)
 {
-    LIST_HEAD(readable_pages);
     struct mm_struct *mm;
     struct pid *pid_struct;
     struct vm_area_struct *vma;
@@ -272,7 +303,7 @@ static void find_duplicates(struct process_info *initial_process)
 
     process = initial_process;
     // Iterate on every task
-    for (i = 0; i < process->total_pids; i++)
+    while (process != NULL)
     {
         pid_struct = find_get_pid(process->pid);
         printk(KERN_INFO "Process Name : %s (pid = %d)", process->name, process->pid);
@@ -289,7 +320,7 @@ static void find_duplicates(struct process_info *initial_process)
         for (vma = mm->mmap; vma; vma = vma->vm_next)
         {
             // Don't append the pages if they don't have the read authorization
-            if (!vma->vm_flags & VM_READ)
+            if (!(vma->vm_flags & VM_READ))
             {
                 continue;
             }
@@ -297,34 +328,68 @@ static void find_duplicates(struct process_info *initial_process)
             // Walk into the pages tables to find the pages
             for (address = vma->vm_start; address < vma->vm_end; address += FIXED_PAGE_SIZE)
             {
+                pgd_t *pgd;
+                p4d_t *p4d;
+                pud_t *pud;
+                pmd_t *pmd;
+                pte_t *pte;
                 // Get the page table entry for the current address
-                pgd_t *pgd = pgd_offset(mm, address);
-                p4d_t *p4d = p4d_offset(pgd, address);
-                pud_t *pud = pud_offset(p4d, address);
-                pmd_t *pmd = pmd_offset(pud, address);
-                pte_t *pte = pte_offset_map(pmd, address);
+                pgd = pgd_offset(mm, address);
+                if (pgd_none(*pgd) || pgd_bad(*pgd))
+                    continue;
+                p4d = p4d_offset(pgd, address);
+                if (p4d_none(*p4d) || p4d_bad(*p4d))
+                    continue;
+                pud = pud_offset(p4d, address);
+                if (pud_none(*pud) || pud_bad(*pud))
+                    continue;
+                pmd = pmd_offset(pud, address);
+                if (pmd_none(*pmd) || pmd_bad(*pmd) || !pmd_present(*pmd))
+                    continue;
+                pte = pte_offset_map(pmd, address);
+                if (!pte || pte_none(*pte))
+                    continue;
 
                 // Append the page to the list if we found it
-                if (pte && pte_present(*pte))
+                if (pte_present(*pte))
                 {
                     struct page_ref *elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
+                    if (!elem)
+                        continue;
                     elem->page = pte_page(*pte);
-                    list_add_tail(&elem->list, &readable_pages);
-                    pte_unmap(pte);
+                    if (elem->page && !PageReserved(elem->page))
+                    {
+                        spin_lock(&readable_pages_lock);
+                        INIT_LIST_HEAD(&elem->list);
+                        list_add_tail(&elem->list, &readable_pages);
+                        spin_unlock(&readable_pages_lock);
+                    }
                 }
+                pte_unmap(pte);
             }
         }
         up_read(&mm->mmap_sem); // Release the memory map semaphore
+        process = process->next;
     }
-
-    if (list_empty(&readable_pages))
-        printk(KERN_INFO "EMPTY");
-
+    spin_lock(&readable_pages_lock);
     list_for_each(pos, &readable_pages)
     {
         nb += 1;
     }
+    spin_unlock(&readable_pages_lock);
     printk(KERN_INFO "%d", nb);
+    if (count_readable_groups(initial_process) == 0)
+        printk(KERN_INFO "HELLO");
+
+    spin_lock(&readable_pages_lock);
+    struct page_ref *p;
+    struct page_ref *s;
+    list_for_each_entry_safe(p, s, &readable_pages, list)
+    {
+        list_del(&p->list);
+        kfree(p);
+    }
+    spin_unlock(&readable_pages_lock);
 
     // TODO: from the list readable_pages and determine the nb_of_group
     // TODO: append the result to the process info data structure
@@ -429,9 +494,6 @@ int save_process_info(struct task_struct *task)
     // Insert into the hash table
     add_to_hash_table(info);
 
-    // TODO: integrate this function at the right place
-    find_duplicates(info);
-
     return 0;
 }
 
@@ -439,6 +501,9 @@ int save_process_info(struct task_struct *task)
 int gather_and_populate_data(void)
 {
     struct task_struct *task;
+    struct process_info *info;
+    unsigned int bkt;
+
     rcu_read_lock();
     for_each_process(task)
     {
@@ -447,6 +512,14 @@ int gather_and_populate_data(void)
             if (save_process_info(task))
                 return -1;
         }
+    }
+
+    hash_for_each(process_hash_table, bkt, info, hnode)
+    {
+        // TODO: integrate this function at the right place
+        printk(KERN_INFO "BEFORE");
+        find_duplicates(info);
+        printk(KERN_INFO "AFTER");
     }
     rcu_read_unlock();
     return 0;
@@ -559,7 +632,7 @@ int handle_filter(char *name)
 
 /// @brief Deletes all process_info for a given name
 /// @param name name of the process_info to be deleted
-int handle_del(char *name) // TODO verify if it works
+int handle_del(char *name)
 {
     struct process_info *info = find_in_hash_table(name), *tmp, *del;
     if (info != NULL)
