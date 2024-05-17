@@ -517,6 +517,8 @@ void reset_output_buffer(void)
 {
     output_buffer_size = 0;
     output_buffer_pos = 0;
+    // Free the output buffer to avoid memory leaks
+    kfree(output_buffer);
 }
 
 /// @brief Free memory allocated to save process information
@@ -526,13 +528,14 @@ void free_process_info(struct process_info *info)
     kfree(info->name);
 }
 
-/// @brief Append data to the output buffer
+/// @brief Append data to the output buffer. This function free the given data parameter at the end of the execution: 
+///        data should not be reused after calling this function !
 /// @param data data to append
 /// @param data_size size of the data
 static int append_to_output_buffer(const char *data, size_t data_size)
 {
     char *new_buffer;
-
+    // Double the size of the output buffer if not enough memory allocated
     if (output_buffer_pos + data_size >= output_buffer_size)
     {
         size_t new_size = (output_buffer_size == 0) ? 1024 : output_buffer_size * 2;
@@ -555,14 +558,17 @@ static int append_to_output_buffer(const char *data, size_t data_size)
 
     memcpy(output_buffer + output_buffer_pos, data, data_size);
     output_buffer_pos += data_size;
+    kfree(data);
     return 0;
 }
 
-int print_file(char *error_message)
+/// @brief Function used to display an error message in the proc file
+/// @param error_message The error message to display
+static int print_file(char *error_message)
 {
     reset_output_buffer();
     if (append_to_output_buffer(error_message, strlen(error_message)))
-        return -1;
+        return err;
 
     return 0;
 }
@@ -644,8 +650,8 @@ out:
     return err;
 }
 
-/// @brief Clear the hash table and free all allocated memory
-void clear_data_structure(void)
+/// @brief Clear the hash table and free the allocated memory
+static void clear_data_structure(void)
 {
     struct process_info *info, *tmp, *del;
     unsigned int bkt;
@@ -665,18 +671,42 @@ void clear_data_structure(void)
     }
 }
 
-/// @brief Append memory information to the output buffer
-/// @param info process_info structure to be appened to the buffer
+/// @brief Append memory information of the given structure to the output buffer
 int append_process_info_to_output(struct process_info *info)
 {
-    char info_buffer[512];
+    char *info_buffer;
     struct process_info *tmp;
+    size_t stringLength, copiedLength;
+    char message[] = "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):";
+    
+    // Compute the required length of the string containing all infos but the pid's
+    stringLength = snprintf(NULL, 0, message,
+                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+                    info->readonly_pages, info->readonly_groups, info->total_pids);
+    
+    info_buffer = kmalloc(sizeof(char) * stringLength, GFP_KERNEL);
+    if (info_buffer == NULL){
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_file("[ERROR] Memory allocation error\n");
+        return err;
+    }
+    
+    // Copy the string to the allocated memory
+    copiedLength = snprintf(info_buffer, stringLength, message,
+                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+                    info->readonly_pages, info->readonly_groups, info->total_pids);
+    
+    // Check that the memory length is enough
+    if (copiedLength != stringLength){
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_file("[ERROR] Memory allocation error\n");
+        goto free_and_return;
+    }
 
-    int len = snprintf(info_buffer, sizeof(info_buffer), "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):",
-                       info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-                       info->readonly_pages, info->readonly_groups, info->total_pids);
-    if (append_to_output_buffer(info_buffer, len))
-        return -1;
+    if (append_to_output_buffer(info_buffer, stringLength))
+        goto free_and_return;
 
     tmp = info;
     while (tmp != NULL)
@@ -700,6 +730,10 @@ int append_process_info_to_output(struct process_info *info)
         }
     }
     return 0;
+    free_and_return:
+        kfree(info_buffer);
+        return err;
+
 }
 
 //////////////
@@ -707,18 +741,18 @@ int append_process_info_to_output(struct process_info *info)
 //////////////
 
 /// @brief Reset the data structure and re-populates it
-int handle_reset(void)
+static int handle_reset(void)
 {
     clear_data_structure();
     if (gather_and_populate_data())
-        return -1;
+        return err;
     if (print_file("[SUCCESS]\n"))
-        return -1;
+        return err;
     return 0;
 }
 
 /// @brief Lists all processes and their memory info
-int handle_all(void)
+static int handle_all(void)
 {
     struct process_info *info;
     unsigned int bkt;
@@ -726,14 +760,14 @@ int handle_all(void)
     hash_for_each(process_hash_table, bkt, info, hnode)
     {
         if (append_process_info_to_output(info))
-            return -1;
+            return err;
     }
     return 0;
 }
 
-/// @brief Filters process_info by name
+/// @brief Print the statistic for the given process name only
 /// @param name name used to filter process_info
-int handle_filter(char *name)
+static int handle_filter(char *name)
 {
     struct process_info *info = find_in_hash_table(name);
     if (!info)
@@ -741,17 +775,17 @@ int handle_filter(char *name)
         err = -ESRCH;
         printk(KERN_ERR "[ERROR]: No such process\n");
         if (print_file("[ERROR]: No such process\n"))
-            return -1;
-        return -1;
+            return err;
+        return err;
     }
     if (append_process_info_to_output(info))
-        return -1;
+        return err;
     return 0;
 }
 
 /// @brief Deletes all process_info for a given name
 /// @param name name of the process_info to be deleted
-int handle_del(char *name)
+static int handle_del(char *name)
 {
     struct process_info *info = find_in_hash_table(name), *tmp, *del;
     if (info != NULL)
@@ -768,52 +802,52 @@ int handle_del(char *name)
         kfree(info);
 
         if (print_file("[SUCCESS]\n"))
-            return -1;
+            return err;
     }
     else
     {
         err = -ESRCH;
         printk(KERN_ERR "[ERROR]: No such process\n");
         if (print_file("[ERROR]: No such process\n"))
-            return -1;
+            return err;
     }
     return 0;
 }
 
-/// @brief Parse the command given by user
-/// @param command string containing the given command
-int process_command(char *command)
+/// @brief Parse the command given by user and call the appropriate function to manage the command
+/// @param command string containing the command given by the user
+static int process_command(char *command)
 {
-    reset_output_buffer();
+    // Clear the content of the previous command
+    if (output_buffer_size != 0)
+        reset_output_buffer();
 
     if (strncmp(command, "RESET", strlen(command)) == 0)
     {
         if (handle_reset())
-            return -1;
-        if (print_file("[SUCCESS]\n"))
-            return -1;
+            return err;
     }
     else if (strncmp(command, "ALL", strlen(command)) == 0)
     {
         if (handle_all())
-            return -1;
+            return err;
     }
     else if (strncmp(command, "FILTER|", 7) == 0)
     {
         if (handle_filter(command + 7)) // Pass the name part of the command
-            return -1;
+            return err;
     }
     else if (strncmp(command, "DEL|", 4) == 0)
     {
         if (handle_del(command + 4)) // Pass the name part of the command
-            return -1;
+            return err;
     }
     else
     {
         err = -EINVAL;
         printk(KERN_ERR "[ERROR]: Invalid argument\n");
         if (print_file("[ERROR]: Invalid argument\n"))
-            return -1;
+            return err;
     }
     return 0;
 }
@@ -845,7 +879,7 @@ static ssize_t procfile_read(struct file *file, char __user *buffer, size_t coun
 }
 
 /// @brief Write operation for the /proc file
-static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset) // TODO return message and not error
+static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
     char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
     if (!command_buffer)
@@ -855,25 +889,31 @@ static ssize_t procfile_write(struct file *file, const char __user *buffer, size
         return -ENOMEM;
     }
 
-    // copy data from user space to kernel space by using copy_from_user
+    // Copy data from user space to kernel space by using copy_from_user
     if (copy_from_user(command_buffer, buffer, count))
     {
-        kfree(command_buffer);
+        
         err = -EFAULT;
         printk(KERN_ERR "[ERROR] Bad address\n");
         print_file("[ERROR] Bad address\n");
-        return err;
+        goto free_and_return;
     }
+
+    // Replace the ending \n by the null character
     if (command_buffer[count - 1] == '\n')
     {
         command_buffer[count - 1] = '\0';
     }
 
     // Process the command
-    if (process_command(command_buffer))
+    if(process_command(command_buffer)){
+        goto free_and_return;
+    }
+    
+    return 0;
+    free_and_return:
+        kfree(command_buffer);
         return err;
-
-    return count;
 }
 
 /*-----------------------------------------------------------------------*/
@@ -914,29 +954,35 @@ static int __init memory_info_init(void)
     if (!our_proc_file)
     {
         printk(KERN_ALERT "[ERROR] Could not create /proc/%s\n", PROCFS_NAME);
-        return -ENOENT;
+        err = -ENOENT;
+        goto free_and_return;
     }
 
     printk(KERN_INFO "/proc/%s created\n", PROCFS_NAME);
 
     // Populate initial data
     err = gather_and_populate_data();
-    if (err)
+    if (err < 0)
     {
         printk(KERN_ALERT "[ERROR] gather_and_populate_data failed with error %d\n", err);
         proc_remove(our_proc_file);
-        return err;
+        goto free_and_return;
     }
 
     printk(KERN_INFO "gather_and_populate_data returned %d\n", err);
-    return 0;
+    
+    return err;
+
+    free_and_return:
+        clear_data_structure();
+        return err;
 }
 
 /// @brief Cleanup module
 static void __exit memory_info_exit(void)
 {
     clear_data_structure();
-
+    kfree(output_buffer);
     // Remove proc entry
     remove_proc_entry(PROCFS_NAME, NULL);
     printk(KERN_INFO "/proc/%s removed\n", PROCFS_NAME);
