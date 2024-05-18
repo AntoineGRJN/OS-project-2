@@ -7,31 +7,54 @@
 #include <linux/slab.h>         // memory allocation (kmalloc/kzalloc)
 #include <linux/kernel.h>       // kernel logging
 #include <linux/sched/signal.h> // For task_struct and process iteration
-#include <linux/mm.h>
-#include <linux/mm_types.h>
-#include <linux/hashtable.h>
-#include <linux/list.h>
-#include <linux/string.h>
-#include <asm/highmem.h>
-#include <linux/crypto.h>
-#include <crypto/hash.h>
+#include <linux/mm.h>           // memory information
+#include <linux/mm_types.h>     // memory information
+#include <linux/hashtable.h>    // hastable
+#include <linux/list.h>         // list
+#include <linux/string.h>       // string (strlen)
+#include <asm/highmem.h>        //
+#include <linux/crypto.h>       // SHA256 hash
+#include <crypto/hash.h>        // SHA256 hash
 
 #define PROCFS_NAME "memory_info" // name of the proc entry
+#define HASH_TABLE_SIZE 16
+#define FIXED_PAGE_SIZE 4096
+#define SHA256_DIGEST_LENGTH 8
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Antoine Grosjean, Florent Hervers");
 MODULE_DESCRIPTION("Creates /proc entry with read/write functionality.");
 
-static char *message = NULL;
+/// @brief Define a hashtable of name [name] and size 2^[bits]
+/// @param  name
+/// @param  bits
+static DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
+
+/// @brief List of hashed readable and valid pages
+static LIST_HEAD(hashed_readable_pages);
+/// @brief List of readable and valid pages
+static LIST_HEAD(readable_pages);
+static DEFINE_SPINLOCK(readable_pages_lock);        // Lock for readable_pages list
+static DEFINE_SPINLOCK(hashed_readable_pages_lock); // Lock for hashed_readable_pages list
+
+/*
+    Global variables
+*/
 
 // Proc dir entry
 static struct proc_dir_entry *our_proc_file;
-
-#define HASH_TABLE_SIZE 16
-#define FIXED_PAGE_SIZE 4096
-#define SHA256_DIGEST_LENGTH 8
-
+// Global variable to return error code
 static int err = 0;
+// Buffer storing the output
+static char *output_buffer = NULL;
+// Size of the output buffer (can be resized if needed)
+static size_t output_buffer_size = 0;
+// Current position for reading in the output buffer
+static size_t output_buffer_pos = 0;
+
+/*
+    Definitions of structures
+*/
 
 /// @brief Structure that stores all values about a set of processes
 /// with the same name.
@@ -43,11 +66,91 @@ struct process_info
     unsigned long total_pages;     // Total number of pages
     unsigned long valid_pages;     // Number of valid pages
     unsigned long invalid_pages;   // Number of invalid pages
-    unsigned long readonly_pages;  // Number of read-only pages
-    unsigned long readonly_groups; // Number of groups of identical read-only pages
+    unsigned long readable_pages;  // Number of readable pages
+    unsigned long readable_groups; // Number of groups of identical readable pages
     struct process_info *next;     // Next node in the hash chain
-    struct hlist_node hnode;
+    struct hlist_node hnode;       // struct for hash table
 };
+/// @brief Structure that stores a readable page
+struct page_ref
+{
+    struct list_head list;
+    struct page *page;
+};
+/// @brief Structure that stores a hash of a readable page and a counter
+/// of the amount of identical page
+struct hash_entry
+{
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    int count; // Number of identical pages
+    struct list_head list;
+};
+
+/*
+    Declarations of the functions
+*/
+
+// Utility functions
+
+struct process_info *gather_items(struct process_info *item1, struct process_info *item2);
+void reset_output_buffer(void);
+void clear_data_structure(void);
+int print_error_message(char *error_message);
+void free_process_info(struct process_info *info);
+
+// Hash table functions
+
+void add_to_hash_table(struct process_info *new_item);
+struct process_info *find_in_hash_table(char *name);
+void remove_from_hash_table(struct process_info *item);
+
+// Set values functions
+
+struct hash_entry *add_hashed_readable_page(unsigned char *hash);
+int count_identical_pages(struct process_info *initial_process);
+int set_valid_pages(struct process_info *initial_process);
+int save_process_info(struct task_struct *task);
+
+// Output buffer functions
+
+int append_to_output_buffer(const char *data, size_t data_size);
+int append_process_info_to_output(struct process_info *info);
+
+// Populate functions
+
+int gather_and_populate_data(void);
+
+// Commands handeling
+
+int handle_reset(void);
+int handle_all(void);
+int handle_filter(char *name);
+int handle_del(char *name);
+int process_command(char *command);
+
+// Read and write in memory_info function and structure
+
+ssize_t procfile_read(struct file *file, char __user *buffer, size_t count, loff_t *offset);
+ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset);
+struct file_operations proc_file_operations = {
+    // defined in linux/fs.h
+    .owner = THIS_MODULE,
+    .read = procfile_read,   // read
+    .write = procfile_write, // write
+};
+
+// Initialise and unload module_project_os
+
+int __init memory_info_init(void);
+void __exit memory_info_exit(void);
+
+/*
+    Definitions of functions
+*/
+
+/*=========
+   Utility
+  =========*/
 
 /// @brief Add the values of the item2 fields to the item1 ones
 /// @param item1 process_info stucture where values of fields will be gathered
@@ -59,18 +162,60 @@ struct process_info *gather_items(struct process_info *item1, struct process_inf
     item1->total_pages += item2->total_pages;
     item1->valid_pages += item2->valid_pages;
     item1->invalid_pages += item2->invalid_pages;
-    item1->readonly_pages += item2->readonly_pages;
-    item1->readonly_groups += item2->readonly_groups;
+    item1->readable_pages += item2->readable_pages;
+    item1->readable_groups += item2->readable_groups;
     return item1;
 }
-////////////////
-// Hash Table //
-////////////////
 
-/// @brief Define a hashtable of name [name] and size 2^[bits]
-/// @param  name
-/// @param  bits
-DEFINE_HASHTABLE(process_hash_table, HASH_TABLE_SIZE);
+/// @brief Reset and clear the output buffer
+void reset_output_buffer(void)
+{
+    output_buffer_size = 0;
+    output_buffer_pos = 0;
+}
+
+/// @brief Clear the hash table and free all allocated memory
+void clear_data_structure(void)
+{
+    struct process_info *info, *tmp, *del;
+    unsigned int bkt;
+
+    hash_for_each(process_hash_table, bkt, info, hnode)
+    {
+        tmp = info->next;
+        while (tmp != NULL)
+        {
+            del = tmp;
+            tmp = tmp->next;
+            free_process_info(del);
+            kfree(del);
+        }
+        remove_from_hash_table(info);
+        kfree(info);
+    }
+}
+
+/// @brief Put [error_message] into the output buffer
+/// @param error_message string to put into output buffer
+int print_error_message(char *error_message)
+{
+    reset_output_buffer();
+    if (append_to_output_buffer(error_message, strlen(error_message)))
+        return -1;
+
+    return 0;
+}
+
+/// @brief Free memory allocated to save process information
+/// @param info process_info structure to be freed
+void free_process_info(struct process_info *info)
+{
+    kfree(info->name);
+}
+
+/*============
+   Hash Table
+  ============*/
 
 /// @brief Add a new item to the hasht table
 /// @param new_item process_info structure to add to the hash table
@@ -83,6 +228,7 @@ void add_to_hash_table(struct process_info *new_item)
     {
         if (strcmp(existing_item->name, new_item->name) == 0)
         {
+            // Append to the end of chained list
             while (existing_item->next != NULL)
             {
                 existing_item = gather_items(existing_item, new_item);
@@ -127,187 +273,68 @@ void remove_from_hash_table(struct process_info *item)
 {
     hash_del(&item->hnode);
 }
-////////////////////////////////////////////////////////////////
 
-// Buffer storing the output
-static char *output_buffer = NULL;
-// Size of the output buffer (can be resized if needed)
-static size_t output_buffer_size = 0;
-// Current position for reading in the output buffer
-static size_t output_buffer_pos = 0;
-
-struct page_ref
-{
-    struct list_head list;
-    struct page *page;
-};
-
-struct hash_entry
-{
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    int count; // Number of identical pages
-    struct list_head list;
-};
-
-LIST_HEAD(hashed_readable_pages_list);
-LIST_HEAD(readable_pages);
-
-static DEFINE_SPINLOCK(readable_pages_lock);
-static DEFINE_SPINLOCK(hashed_readable_pages_lock);
-
-// If we decide to compare pages instead of hash
-/*int compare_pages(struct page *page1, struct page *page2) {
-    void *kaddr1, *kaddr2;
-    int result;
-
-    // Map the pages into kernel address space
-    kaddr1 = kmap(page1);
-    kaddr2 = kmap(page2);
-
-    // Compare the contents
-    result = memcmp(kaddr1, kaddr2, PAGE_SIZE);
-
-    // Unmap the pages
-    kunmap(page1);
-    kunmap(page2);
-
-    return result;
-}*/
+/*============
+   Set values
+  ============*/
 
 struct hash_entry *add_hashed_readable_page(unsigned char *hash)
 {
     struct hash_entry *entry;
-    list_for_each_entry(entry, &hashed_readable_pages_list, list)
+    // Check for extisting entry
+    list_for_each_entry(entry, &hashed_readable_pages, list)
     {
         if (memcmp(entry->hash, hash, SHA256_DIGEST_LENGTH) == 0)
         {
             return entry;
         }
     }
-    entry = kmalloc(sizeof(struct hash_entry), GFP_KERNEL); // TODO allocation error
+    entry = kmalloc(sizeof(struct hash_entry), GFP_KERNEL);
     if (!entry)
+    {
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_error_message("[ERROR] Memory allocation error\n");
         return NULL;
+    }
+
     memcpy(entry->hash, hash, SHA256_DIGEST_LENGTH);
     entry->count = 0;
+
+    // Add to the list
     INIT_LIST_HEAD(&entry->list);
-    list_add(&entry->list, &hashed_readable_pages_list);
+    list_add(&entry->list, &hashed_readable_pages);
     return entry;
 }
 
-/*int count_readable_groups(struct process_info *initial_process)
+int count_identical_pages(struct process_info *initial_process)
 {
     int may_be_shared = 0;
     int group_count = 0;
     struct crypto_shash *tfm;
     struct shash_desc *desc;
     struct page_ref *page;
-    int i = 0;
-
-    tfm = crypto_alloc_shash("sha256", 0, 0);
-    if (IS_ERR(tfm))
-    {
-        pr_err("Failed to allocate shash\n");
-        return PTR_ERR(tfm);
-    }
-
-    desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL); // TODO allocation error
-    if (!desc)
-    {
-        crypto_free_shash(tfm);
-        return -ENOMEM;
-    }
-    desc->tfm = tfm;
-
-    spin_lock(&readable_pages_lock);
-    list_for_each_entry(page, &readable_pages, list)
-    {
-        unsigned char *kaddr;
-        unsigned char hash[SHA256_DIGEST_LENGTH];
-        printk(KERN_INFO "in: %d", i);
-        kaddr = kmap(page->page);
-        crypto_shash_init(desc);
-        crypto_shash_update(desc, kaddr, FIXED_PAGE_SIZE);
-        crypto_shash_final(desc, hash);
-        kunmap(page->page);
-        printk(KERN_INFO "out: %d", i);
-        struct hash_entry *entry = add_hashed_readable_page(hash);
-        if (entry)
-        {
-            entry->count++;
-        }
-        i++;
-    }
-    spin_unlock(&readable_pages_lock);
-
-    printk(KERN_INFO "finish");
-
-    // Count the number of groups of identical pages
-    spin_lock(&hashed_readable_pages_lock);
     struct hash_entry *entry;
-    list_for_each_entry(entry, &hashed_readable_pages_list, list)
-    {
-        if (entry->count > 1)
-        {
-            may_be_shared += entry->count;
-            group_count++;
-        }
-        else
-        {
-            printk(KERN_INFO "loop: %d", entry->count);
-        }
-    }
-    spin_unlock(&hashed_readable_pages_lock);
-
-    initial_process->readonly_pages = may_be_shared;
-    initial_process->readonly_groups = group_count;
-    printk(KERN_INFO "may be shared: %d", may_be_shared);
-    printk(KERN_INFO "groups: %d", group_count);
-
-    kfree(desc);
-    crypto_free_shash(tfm);
-
-    printk(KERN_INFO "start free");
-    // Free the hash list
-    spin_lock(&hashed_readable_pages_lock);
-    struct hash_entry *e;
+    struct hash_entry *to_del;
     struct hash_entry *s;
-    list_for_each_entry_safe(e, s, &hashed_readable_pages_list, list)
-    {
-        list_del(&e->list);
-        kfree(e);
-    }
-    spin_unlock(&hashed_readable_pages_lock);
-
-    if (list_empty(&hashed_readable_pages_list))
-    {
-        printk(KERN_INFO "freed");
-    }
-    printk(KERN_INFO "return");
-    return 0;
-}
-*/
-
-static int count_readable_groups(struct process_info *initial_process)
-{
-    int may_be_shared = 0;
-    int group_count = 0;
-    struct crypto_shash *tfm;
-    struct shash_desc *desc;
-    struct page_ref *page;
-    int i = 0;
 
     tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(tfm))
     {
-        pr_err("Failed to allocate shash\n");
-        return PTR_ERR(tfm);
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_error_message("[ERROR] Memory allocation error\n");
+        return -1;
     }
 
     desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
     if (!desc)
     {
         crypto_free_shash(tfm);
-        return -ENOMEM;
+        err = -ENOMEM;
+        printk(KERN_ERR "[ERROR] Memory allocation error\n");
+        print_error_message("[ERROR] Memory allocation error\n");
+        return -1;
     }
     desc->tfm = tfm;
 
@@ -316,96 +343,94 @@ static int count_readable_groups(struct process_info *initial_process)
     {
         unsigned char *kaddr;
         unsigned char hash[SHA256_DIGEST_LENGTH];
+        struct hash_entry *new_entry;
 
-        if (!page || !page->page) {
-            pr_err("Invalid page entry\n");
-            continue;
+        if (!page || !page->page)
+        {
+            kfree(desc);
+            crypto_free_shash(tfm);
+            printk(KERN_ERR "[ERROR] Invalid page entry\n");
+            print_error_message("[ERROR] Invalid page entry\n");
+            return -1;
         }
-
-        printk(KERN_INFO "Processing page: %d", i);
         kaddr = kmap(page->page);
-        if (!kaddr) {
-            pr_err("Failed to map page\n");
-            continue;
+        if (!kaddr)
+        {
+            kfree(desc);
+            crypto_free_shash(tfm);
+            printk(KERN_ERR "[ERROR] Failed to map page\n");
+            print_error_message("[ERROR] Failed to map page\n");
+            return -1;
         }
 
+        // Hash the page and create the hash to add to the list
         crypto_shash_init(desc);
         crypto_shash_update(desc, kaddr, FIXED_PAGE_SIZE);
         crypto_shash_final(desc, hash);
         kunmap(page->page);
-        printk(KERN_INFO "Completed page: %d", i);
 
-        struct hash_entry *entry = add_hashed_readable_page(hash);
-        if (entry)
+        new_entry = add_hashed_readable_page(hash);
+        if (!new_entry)
         {
-            entry->count++;
+            spin_unlock(&readable_pages_lock);
+            kfree(desc);
+            crypto_free_shash(tfm);
+            spin_lock(&hashed_readable_pages_lock);
+            list_for_each_entry_safe(to_del, s, &hashed_readable_pages, list)
+            {
+                list_del(&to_del->list);
+                kfree(to_del);
+            }
+            spin_unlock(&hashed_readable_pages_lock);
+            return -1;
         }
-        i++;
+        new_entry->count++;
     }
     spin_unlock(&readable_pages_lock);
 
-    printk(KERN_INFO "Finished processing pages");
-
     // Count the number of groups of identical pages
     spin_lock(&hashed_readable_pages_lock);
-    struct hash_entry *entry;
-    list_for_each_entry(entry, &hashed_readable_pages_list, list)
+    list_for_each_entry(entry, &hashed_readable_pages, list)
     {
         if (entry->count > 1)
         {
             may_be_shared += entry->count;
             group_count++;
         }
-        else
-        {
-            printk(KERN_INFO "loop: %d", entry->count);
-        }
     }
     spin_unlock(&hashed_readable_pages_lock);
 
-    initial_process->readonly_pages = may_be_shared;
-    initial_process->readonly_groups = group_count;
-    printk(KERN_INFO "may be shared: %d", may_be_shared);
-    printk(KERN_INFO "groups: %d", group_count);
+    // Set values in the process_info
+    initial_process->readable_pages = may_be_shared;
+    initial_process->readable_groups = group_count;
 
     kfree(desc);
     crypto_free_shash(tfm);
 
-    printk(KERN_INFO "start free");
     // Free the hash list
     spin_lock(&hashed_readable_pages_lock);
-    struct hash_entry *e;
-    struct hash_entry *s;
-    list_for_each_entry_safe(e, s, &hashed_readable_pages_list, list)
+    list_for_each_entry_safe(to_del, s, &hashed_readable_pages, list)
     {
-        list_del(&e->list);
-        kfree(e);
+        list_del(&to_del->list);
+        kfree(to_del);
     }
     spin_unlock(&hashed_readable_pages_lock);
 
-    if (list_empty(&hashed_readable_pages_list))
-    {
-        printk(KERN_INFO "freed");
-    }
-    printk(KERN_INFO "return");
     return 0;
 }
 
-/**
- * @brief given the intial_process, find if there are identical readable pages and append the value to the given struct
- */
-static void find_duplicates(struct process_info *initial_process)
+///@brief given the intial_process, find if there are identical readable
+/// pages and append the value to the given struct
+///@param initial_process process_info struct where values for pages will be set
+int set_valid_pages(struct process_info *initial_process)
 {
     struct mm_struct *mm;
     struct pid *pid_struct;
     struct vm_area_struct *vma;
-    struct page *page;
-    int i;
     unsigned long address;
     struct process_info *process;
-    int nb = 0;
-    struct list_head *pos;
-    // Counter to keep track of valid_pages
+    struct page_ref *to_del;
+    struct page_ref *s;
     int valid_pages = 0;
 
     process = initial_process;
@@ -413,17 +438,16 @@ static void find_duplicates(struct process_info *initial_process)
     while (process != NULL)
     {
         pid_struct = find_get_pid(process->pid);
-        printk(KERN_INFO "Process Name : %s (pid = %d)", process->name, process->pid);
         mm = pid_task(pid_struct, PIDTYPE_PID)->mm;
         if (!mm)
         {
-            printk(KERN_INFO "No memory management structure for the process.\n");
-            return;
+            printk(KERN_ERR "[ERROR] No memory management structure for the process.\n");
+            print_error_message("[ERROR] No memory management structure for the process.\n");
+            return -1;
         }
 
         // Lock the memory map semaphore
         down_read(&mm->mmap_sem);
-
         for (vma = mm->mmap; vma; vma = vma->vm_next)
         {
             // Walk into the pages tables to find the pages
@@ -451,16 +475,30 @@ static void find_duplicates(struct process_info *initial_process)
                 if (!pte || pte_none(*pte))
                     continue;
 
-                // Append the page to the list if we found it + append the pages only if they have the read authorization
-        
+                // Append the page to the list if we found it
                 if (pte_present(*pte))
                 {
                     valid_pages += 1;
-                    if (vma->vm_flags & VM_READ) 
+                    // append the pages only if they have the read authorization
+                    if (vma->vm_flags & VM_READ)
                     {
                         struct page_ref *elem = kmalloc(sizeof(struct page_ref), GFP_KERNEL);
                         if (!elem)
-                            continue;
+                        {
+                            pte_unmap(pte);
+                            up_read(&mm->mmap_sem);
+                            spin_lock(&readable_pages_lock);
+                            list_for_each_entry_safe(to_del, s, &readable_pages, list)
+                            {
+                                list_del(&to_del->list);
+                                kfree(to_del);
+                            }
+                            spin_unlock(&readable_pages_lock);
+                            err = -ENOMEM;
+                            printk(KERN_ERR "[ERROR] Memory allocation error\n");
+                            print_error_message("[ERROR] Memory allocation error\n");
+                            return -1;
+                        }
                         elem->page = pte_page(*pte);
                         if (elem->page && !PageReserved(elem->page))
                         {
@@ -470,7 +508,7 @@ static void find_duplicates(struct process_info *initial_process)
                             spin_unlock(&readable_pages_lock);
                         }
                     }
-                } 
+                }
                 pte_unmap(pte);
             }
         }
@@ -487,87 +525,27 @@ static void find_duplicates(struct process_info *initial_process)
         process = process->next;
     }
 
-    spin_lock(&readable_pages_lock);
-    list_for_each(pos, &readable_pages)
+    // Count the number of identical pages and group of identical pages
+    if (count_identical_pages(initial_process))
     {
-        nb += 1;
+        spin_lock(&readable_pages_lock);
+        list_for_each_entry_safe(to_del, s, &readable_pages, list)
+        {
+            list_del(&to_del->list);
+            kfree(to_del);
+        }
+        spin_unlock(&readable_pages_lock);
+        return -1;
+    }
+
+    // Free the list
+    spin_lock(&readable_pages_lock);
+    list_for_each_entry_safe(to_del, s, &readable_pages, list)
+    {
+        list_del(&to_del->list);
+        kfree(to_del);
     }
     spin_unlock(&readable_pages_lock);
-    printk(KERN_INFO "%d", nb);
-    if (count_readable_groups(initial_process) == 0)
-        printk(KERN_INFO "HELLO");
-
-    spin_lock(&readable_pages_lock);
-    struct page_ref *p;
-    struct page_ref *s;
-    list_for_each_entry_safe(p, s, &readable_pages, list)
-    {
-        list_del(&p->list);
-        kfree(p);
-    }
-    spin_unlock(&readable_pages_lock);
-
-    // TODO: from the list readable_pages and determine the nb_of_group
-    // TODO: append the result to the process info data structure
-    return;
-}
-
-/// @brief Reset and clear the output buffer
-void reset_output_buffer(void)
-{
-    output_buffer_size = 0;
-    output_buffer_pos = 0;
-    // Free the output buffer to avoid memory leaks
-    kfree(output_buffer);
-}
-
-/// @brief Free memory allocated to save process information
-/// @param info process_info structure to be freed
-void free_process_info(struct process_info *info)
-{
-    kfree(info->name);
-}
-
-/// @brief Append data to the output buffer. This function free the given data parameter at the end of the execution: 
-///        data should not be reused after calling this function !
-/// @param data data to append
-/// @param data_size size of the data
-static int append_to_output_buffer(const char *data, size_t data_size)
-{
-    char *new_buffer;
-    // Double the size of the output buffer if not enough memory allocated
-    if (output_buffer_pos + data_size >= output_buffer_size)
-    {
-        size_t new_size = (output_buffer_size == 0) ? 1024 : output_buffer_size * 2;
-        while (output_buffer_pos + data_size >= new_size)
-        {
-            new_size *= 2;
-        }
-        new_buffer = krealloc(output_buffer, new_size, GFP_KERNEL);
-        if (!new_buffer)
-        {
-            err = -ENOMEM;
-            printk(KERN_ERR "[ERROR] Memory allocation error\n");
-            reset_output_buffer();
-            append_to_output_buffer("[ERROR] Memory allocation error\n", strlen("[ERROR] Memory allocation error\n"));
-            return err;
-        }
-        output_buffer = new_buffer;
-        output_buffer_size = new_size;
-    }
-
-    memcpy(output_buffer + output_buffer_pos, data, data_size);
-    output_buffer_pos += data_size;
-    return 0;
-}
-
-/// @brief Function used to display an error message in the proc file
-/// @param error_message The error message to display
-static int print_file(char *error_message)
-{
-    reset_output_buffer();
-    if (append_to_output_buffer(error_message, strlen(error_message)))
-        return err;
 
     return 0;
 }
@@ -577,13 +555,11 @@ static int print_file(char *error_message)
 int save_process_info(struct task_struct *task)
 {
     struct process_info *info = kmalloc(sizeof(struct process_info), GFP_KERNEL);
-    unsigned long valid_pages = 0;
-
     if (!info)
     {
         err = -ENOMEM;
         printk(KERN_ERR "[ERROR] Memory allocation error\n");
-        print_file("[ERROR] Memory allocation error\n");
+        print_error_message("[ERROR] Memory allocation error\n");
         return -1;
     }
     // Initialize the struct
@@ -592,7 +568,7 @@ int save_process_info(struct task_struct *task)
     {
         err = -ENOMEM;
         printk(KERN_ERR "[ERROR] Memory allocation error\n");
-        print_file("[ERROR] Memory allocation error\n");
+        print_error_message("[ERROR] Memory allocation error\n");
         return -1;
     }
     info->pid = task->pid;
@@ -603,10 +579,10 @@ int save_process_info(struct task_struct *task)
         info->total_pages = task->mm->total_vm;
     }
 
-    info->valid_pages = 0;                             // Example for valid pages
-    info->invalid_pages = 0; // Simplified calculation
-    info->readonly_pages = 0;                                    // TODO count_readonly_pages(task);
-    info->readonly_groups = 0;                                   // TODO count_readonly_groups(task); // Placeholder for actual implementation
+    info->valid_pages = 0;
+    info->invalid_pages = 0;
+    info->readable_pages = 0;
+    info->readable_groups = 0;
     info->next = NULL;
 
     // Insert into the hash table
@@ -615,111 +591,105 @@ int save_process_info(struct task_struct *task)
     return 0;
 }
 
-/// @brief Gather and populate process information
-int gather_and_populate_data(void)
+/*==============
+  Output Buffer
+ ===============*/
+
+/// @brief Append data to the output buffer
+/// @param data data to append
+/// @param data_size size of the data
+int append_to_output_buffer(const char *data, size_t data_size)
 {
-    struct task_struct *task;
-    struct process_info *info;
-    unsigned int bkt;
-    int err = 0;
+    char *new_buffer;
 
-    rcu_read_lock();
-    for_each_process(task)
+    // Check if the output buffer is large enough to append data
+    if (output_buffer_pos + data_size >= output_buffer_size)
     {
-        if (task->mm)
-        { // Ensure the task has a memory descriptor
-            if (save_process_info(task)){
-                err = -1;
-                goto out;
-            }
-        }
-    }
-
-    hash_for_each(process_hash_table, bkt, info, hnode)
-    {
-        // TODO: integrate this function at the right place
-        printk(KERN_INFO "BEFORE");
-        find_duplicates(info);
-        printk(KERN_INFO "AFTER");
-    }
-
-out:
-    rcu_read_unlock();
-    printk(KERN_INFO "gather_and_populate return code: %d", err);
-    return err;
-}
-
-/// @brief Clear the hash table and free the allocated memory
-static void clear_data_structure(void)
-{
-    struct process_info *info, *tmp, *del;
-    unsigned int bkt;
-
-    hash_for_each(process_hash_table, bkt, info, hnode)
-    {
-        tmp = info->next;
-        while (tmp != NULL)
+        // Multiply size of buffer by two untill there is enough space for data
+        size_t new_size = (output_buffer_size == 0) ? 1024 : output_buffer_size * 2;
+        while (output_buffer_pos + data_size >= new_size)
         {
-            del = tmp;
-            tmp = tmp->next;
-            free_process_info(del);
-            kfree(del);
+            new_size *= 2;
         }
-        remove_from_hash_table(info);
-        kfree(info);
+        new_buffer = krealloc(output_buffer, new_size, GFP_KERNEL);
+        if (!new_buffer)
+        {
+            err = -ENOMEM;
+            printk(KERN_ERR "[ERROR] Memory allocation error\n");
+            print_error_message("[ERROR] Memory allocation error\n");
+            return -1;
+        }
+        output_buffer = new_buffer;
+        output_buffer_size = new_size;
     }
+
+    memcpy(output_buffer + output_buffer_pos, data, data_size);
+    output_buffer_pos += data_size;
+    return 0;
 }
 
-/// @brief Append memory information of the given structure to the output buffer
+/// @brief Append memory information to the output buffer
+/// @param info process_info structure to be appended to the buffer
 int append_process_info_to_output(struct process_info *info)
 {
-    char *info_buffer;
     struct process_info *tmp;
-    size_t stringLength, copiedLength;
-    char message[] = "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):";
-    
-    // Compute the required length of the string containing all infos but the pid's
-    stringLength = 1024; /*snprintf(NULL, 0, message,
-                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-                    info->readonly_pages, info->readonly_groups, info->total_pids);*/
-    printk(KERN_INFO "Given: length: %d\n", snprintf(NULL, 0, message,
-                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-                    info->readonly_pages, info->readonly_groups, info->total_pids));
-    info_buffer = kmalloc(sizeof(char) * (stringLength + 1) , GFP_KERNEL);
-    if (info_buffer == NULL){
+    int len;
+    char *info_buffer;
+    char *pid_buffer;
+
+    // Calculate the length of the info_buffer
+    len = snprintf(NULL, 0, "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):",
+                   info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+                   info->readable_pages, info->readable_groups, info->total_pids);
+
+    info_buffer = kmalloc(len + 1, GFP_KERNEL);
+    if (!info_buffer)
+    {
         err = -ENOMEM;
         printk(KERN_ERR "[ERROR] Memory allocation error\n");
-        print_file("[ERROR] Memory allocation error\n");
-        return err;
-    }
-    
-    // Copy the string to the allocated memory
-    copiedLength = snprintf(info_buffer, stringLength, message,
-                    info->name, info->total_pages, info->valid_pages, info->invalid_pages,
-                    info->readonly_pages, info->readonly_groups, info->total_pids);
-    
-    // Check that the memory length is enough
-    if (copiedLength != stringLength){
-        err = -ENOMEM;
-        printk(KERN_ERR "[ERROR] Memory allocation error\n");
-        print_file("[ERROR] Memory allocation error\n");
-        goto free_and_return;
+        print_error_message("[ERROR] Memory allocation error\n");
+        return -1;
     }
 
-    if (append_to_output_buffer(info_buffer, stringLength))
-        goto free_and_return;
+    // Write the formatted string into the allocated buffer
+    snprintf(info_buffer, len + 1, "%s, total: %lu, valid: %lu, invalid: %lu, may_be_shared: %lu, nb_group: %lu, pid(%d):",
+             info->name, info->total_pages, info->valid_pages, info->invalid_pages,
+             info->readable_pages, info->readable_groups, info->total_pids);
 
+    if (append_to_output_buffer(info_buffer, len))
+    {
+        kfree(info_buffer);
+        return -1;
+    }
     kfree(info_buffer);
+
     tmp = info;
     while (tmp != NULL)
     {
-        // TODO: check if 32 is enough
-        char pid_buffer[32];
-        int pid_len = snprintf(pid_buffer, sizeof(pid_buffer), " %u", tmp->pid);
-        if (append_to_output_buffer(pid_buffer, pid_len))
+        // Calculate the length of the pid_buffer
+        len = snprintf(NULL, 0, " %u", tmp->pid);
+
+        pid_buffer = kmalloc(len + 1, GFP_KERNEL);
+        if (!pid_buffer)
+        {
+            err = -ENOMEM;
+            printk(KERN_ERR "[ERROR] Memory allocation error\n");
+            print_error_message("[ERROR] Memory allocation error\n");
             return -1;
+        }
+
+        // Write the formatted string into the allocated buffer
+        snprintf(pid_buffer, len + 1, " %u", tmp->pid);
+
+        if (append_to_output_buffer(pid_buffer, len))
+        {
+            kfree(pid_buffer);
+            return -1;
+        }
+        kfree(pid_buffer);
 
         tmp = tmp->next;
+        // Add end char= /n or ;
         if (!tmp)
         {
             if (append_to_output_buffer("\n", strlen("\n")))
@@ -727,34 +697,68 @@ int append_process_info_to_output(struct process_info *info)
         }
         else
         {
-            if (append_to_output_buffer(";", strlen("\n")))
+            if (append_to_output_buffer(";", strlen(";")))
                 return -1;
         }
     }
     return 0;
-    free_and_return:
-        kfree(info_buffer);
-        return err;
-
 }
 
-//////////////
-// Commands //
-//////////////
+/*==========
+  Populate
+ ==========*/
+
+/// @brief Gather and populate process information
+int gather_and_populate_data(void)
+{
+    struct task_struct *task;
+    struct process_info *info;
+    unsigned int bkt;
+
+    rcu_read_lock();
+    for_each_process(task)
+    {
+        if (task->mm)
+        { // Ensure the task has a memory descriptor
+            if (save_process_info(task))
+            {
+                clear_data_structure();
+                rcu_read_unlock();
+                return -1;
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    hash_for_each(process_hash_table, bkt, info, hnode)
+    {
+        if (set_valid_pages(info))
+        {
+            clear_data_structure();
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/*==========
+   Commands
+ ===========*/
 
 /// @brief Reset the data structure and re-populates it
-static int handle_reset(void)
+int handle_reset(void)
 {
     clear_data_structure();
     if (gather_and_populate_data())
-        return err;
-    if (print_file("[SUCCESS]\n"))
-        return err;
+        return -1;
+    if (print_error_message("[SUCCESS]\n"))
+        return -1;
     return 0;
 }
 
 /// @brief Lists all processes and their memory info
-static int handle_all(void)
+int handle_all(void)
 {
     struct process_info *info;
     unsigned int bkt;
@@ -762,32 +766,32 @@ static int handle_all(void)
     hash_for_each(process_hash_table, bkt, info, hnode)
     {
         if (append_process_info_to_output(info))
-            return err;
+            return -1;
     }
     return 0;
 }
 
-/// @brief Print the statistic for the given process name only
+/// @brief Filters process_info by name
 /// @param name name used to filter process_info
-static int handle_filter(char *name)
+int handle_filter(char *name)
 {
     struct process_info *info = find_in_hash_table(name);
     if (!info)
     {
         err = -ESRCH;
         printk(KERN_ERR "[ERROR]: No such process\n");
-        if (print_file("[ERROR]: No such process\n"))
-            return err;
-        return err;
+        if (print_error_message("[ERROR]: No such process\n"))
+            return -1;
+        return -1;
     }
     if (append_process_info_to_output(info))
-        return err;
+        return -1;
     return 0;
 }
 
 /// @brief Deletes all process_info for a given name
 /// @param name name of the process_info to be deleted
-static int handle_del(char *name)
+int handle_del(char *name)
 {
     struct process_info *info = find_in_hash_table(name), *tmp, *del;
     if (info != NULL)
@@ -803,61 +807,63 @@ static int handle_del(char *name)
         remove_from_hash_table(info);
         kfree(info);
 
-        if (print_file("[SUCCESS]\n"))
-            return err;
+        if (print_error_message("[SUCCESS]\n"))
+            return -1;
     }
     else
     {
         err = -ESRCH;
         printk(KERN_ERR "[ERROR]: No such process\n");
-        if (print_file("[ERROR]: No such process\n"))
-            return err;
+        if (print_error_message("[ERROR]: No such process\n"))
+            return -1;
     }
     return 0;
 }
 
-/// @brief Parse the command given by user and call the appropriate function to manage the command
-/// @param command string containing the command given by the user
-static int process_command(char *command)
+/// @brief Parse the command given by user
+/// @param command string containing the given command
+int process_command(char *command)
 {
-    // Clear the content of the previous command
-    if (output_buffer_size != 0)
-        reset_output_buffer();
+    reset_output_buffer();
 
     if (strncmp(command, "RESET", strlen(command)) == 0)
     {
         if (handle_reset())
-            return err;
+            return -1;
+        if (print_error_message("[SUCCESS]\n"))
+            return -1;
     }
     else if (strncmp(command, "ALL", strlen(command)) == 0)
     {
         if (handle_all())
-            return err;
+            return -1;
     }
     else if (strncmp(command, "FILTER|", 7) == 0)
     {
         if (handle_filter(command + 7)) // Pass the name part of the command
-            return err;
+            return -1;
     }
     else if (strncmp(command, "DEL|", 4) == 0)
     {
         if (handle_del(command + 4)) // Pass the name part of the command
-            return err;
+            return -1;
     }
     else
     {
         err = -EINVAL;
         printk(KERN_ERR "[ERROR]: Invalid argument\n");
-        if (print_file("[ERROR]: Invalid argument\n"))
-            return err;
+        if (print_error_message("[ERROR]: Invalid argument\n"))
+            return -1;
     }
     return 0;
 }
 
-//////////////////////////////////////////////////////////////
+/*================
+   Read and Write
+ =================*/
 
 /// @brief Read operation for the /proc file
-static ssize_t procfile_read(struct file *file, char __user *buffer, size_t count, loff_t *offset)
+ssize_t procfile_read(struct file *file, char __user *buffer, size_t count, loff_t *offset)
 {
     size_t available;
     size_t to_copy;
@@ -872,7 +878,7 @@ static ssize_t procfile_read(struct file *file, char __user *buffer, size_t coun
         kfree(output_buffer);
         err = -EFAULT;
         printk(KERN_ERR "[ERROR] Bad address\n");
-        print_file("[ERROR] Bad address\n");
+        print_error_message("[ERROR] Bad address\n");
         return err;
     }
 
@@ -881,71 +887,44 @@ static ssize_t procfile_read(struct file *file, char __user *buffer, size_t coun
 }
 
 /// @brief Write operation for the /proc file
-static ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
+ssize_t procfile_write(struct file *file, const char __user *buffer, size_t count, loff_t *offset)
 {
     char *command_buffer = kzalloc(count + 1, GFP_KERNEL);
     if (!command_buffer)
     {
+        err = -ENOMEM;
         printk(KERN_ERR "[ERROR] Memory allocation error\n");
-        print_file("[ERROR] Memory allocation error\n");
-        return -ENOMEM;
+        print_error_message("[ERROR] Memory allocation error\n");
+        return count;
     }
 
-    // Copy data from user space to kernel space by using copy_from_user
+    // copy data from user space to kernel space by using copy_from_user
     if (copy_from_user(command_buffer, buffer, count))
     {
-        
+        kfree(command_buffer);
         err = -EFAULT;
         printk(KERN_ERR "[ERROR] Bad address\n");
-        print_file("[ERROR] Bad address\n");
-        goto free_and_return;
+        print_error_message("[ERROR] Bad address\n");
+        return count;
     }
-
-    // Replace the ending \n by the null character
     if (command_buffer[count - 1] == '\n')
     {
         command_buffer[count - 1] = '\0';
     }
 
     // Process the command
-    if(process_command(command_buffer)){
-        goto free_and_return;
-    }
-    
-    return 0;
-    free_and_return:
-        kfree(command_buffer);
-        return err;
+    if (process_command(command_buffer))
+        return count;
+
+    return count;
 }
 
-/*-----------------------------------------------------------------------*/
-// Structure that associates a set of function pointers (e.g., device_open)
-// that implement the corresponding file operations (e.g., open).
-/*-----------------------------------------------------------------------*/
-// this function reads a message from the pseudo file system via the seq_printf function
-static int show_the_proc(struct seq_file *a, void *v)
-{
-    seq_printf(a, "%s\n", message);
-    return 0;
-}
-
-// this function opens the proc entry by calling the show_the_proc function
-static int open_the_proc(struct inode *inode, struct file *file)
-{
-    return single_open(file, show_the_proc, NULL);
-}
-static struct file_operations proc_file_operations = {
-    // defined in linux/fs.h
-    .owner = THIS_MODULE,
-    .open = open_the_proc, // open callback
-    .release = single_release,
-    .read = procfile_read,   // read
-    .write = procfile_write, // write callback
-    .llseek = seq_lseek,
-};
+/*=================
+   Init and unload
+ ==================*/
 
 /// @brief Initialize module
-static int __init memory_info_init(void)
+int __init memory_info_init(void)
 {
     int err = 0;
 
@@ -956,35 +935,24 @@ static int __init memory_info_init(void)
     if (!our_proc_file)
     {
         printk(KERN_ALERT "[ERROR] Could not create /proc/%s\n", PROCFS_NAME);
-        err = -ENOENT;
-        goto free_and_return;
+        return -ENOENT;
     }
-
     printk(KERN_INFO "/proc/%s created\n", PROCFS_NAME);
 
     // Populate initial data
-    err = gather_and_populate_data();
-    if (err < 0)
+    if (gather_and_populate_data())
     {
-        printk(KERN_ALERT "[ERROR] gather_and_populate_data failed with error %d\n", err);
         proc_remove(our_proc_file);
-        goto free_and_return;
+        return err;
     }
 
-    printk(KERN_INFO "gather_and_populate_data returned %d\n", err);
-    
     return err;
-
-    free_and_return:
-        clear_data_structure();
-        return err;
 }
 
 /// @brief Cleanup module
-static void __exit memory_info_exit(void)
+void __exit memory_info_exit(void)
 {
     clear_data_structure();
-    kfree(output_buffer);
     // Remove proc entry
     remove_proc_entry(PROCFS_NAME, NULL);
     printk(KERN_INFO "/proc/%s removed\n", PROCFS_NAME);
